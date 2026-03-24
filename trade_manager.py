@@ -1,0 +1,365 @@
+"""
+trade_manager.py
+----------------
+Actively manages open positions to enforce short-term trading discipline.
+
+Responsibilities:
+  • Stop-loss:   Close positions when unrealised P&L drops below -STOP_LOSS_PCT.
+  • Trailing stop: Once a position gains TRAILING_STOP_ACTIVATION%, lock in
+    profits by selling if price retraces TRAILING_STOP_PCT from its peak.
+  • Take-profit: Close positions when unrealised P&L exceeds TAKE_PROFIT_PCT.
+  • Time exit:   Close positions open longer than MAX_HOLD_TIME seconds.
+
+Exit priority order per cycle:
+    stop-loss > trailing stop > take-profit > time exit
+
+All exits generate a TradeSignal(side="SELL") executed through the Executor.
+"""
+
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, TYPE_CHECKING
+
+from config import Config
+from execution import Executor, ExecutionResult
+from position_tracker import Position, PositionTracker
+from strategies.base import TradeSignal
+
+if TYPE_CHECKING:
+    from market_scanner import MarketScanner
+
+logger = logging.getLogger("bot.trade_manager")
+
+
+@dataclass
+class PositionMeta:
+    """
+    Per-position tracking data maintained by TradeManager.
+
+    Stores the high-water-mark price (for trailing stops) and whether the
+    trailing stop has been activated for a given position.
+    """
+
+    token_id: str
+    high_water_mark: float = 0.0         # Highest price seen since position opened
+    trailing_stop_active: bool = False    # True once TRAILING_STOP_ACTIVATION is hit
+    trailing_stop_price: float = 0.0     # Price at which trailing stop triggers
+    exit_attempted: bool = False          # Guard against double-exit attempts
+    partial_exit_done: bool = False      # True after the 50% scale-out at +10%
+    original_size: float = 0.0           # Size at position open (before partial exit)
+
+
+class TradeManager:
+    """
+    Monitors open positions each cycle and applies exit rules.
+
+    Usage:
+        manager = TradeManager(tracker, executor, config, scanner)
+        # Called every cycle after strategies have been scanned:
+        manager.manage_positions()
+    """
+
+    def __init__(
+        self,
+        tracker: PositionTracker,
+        executor: Executor,
+        cfg: Config,
+        market_scanner: Optional["MarketScanner"] = None,
+    ) -> None:
+        self.tracker = tracker
+        self.executor = executor
+        self.cfg = cfg
+        self.market_scanner = market_scanner
+
+        # token_id -> PositionMeta for trailing stop tracking
+        self._meta: Dict[str, PositionMeta] = {}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Public API
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def manage_positions(self) -> List[ExecutionResult]:
+        """
+        Evaluate all open positions and execute exits where triggered.
+
+        Should be called once per bot cycle, after strategy scans and after
+        position prices have been refreshed by PositionTracker.refresh().
+
+        Returns:
+            List of ExecutionResult objects for any exits attempted.
+        """
+        positions = [p for p in self.tracker.get_all_positions() if not p.resolved]
+
+        if not positions:
+            logger.debug("TradeManager: no open positions to manage.")
+            return []
+
+        results: List[ExecutionResult] = []
+
+        for pos in positions:
+            try:
+                result = self._evaluate_position(pos)
+                if result:
+                    results.append(result)
+            except Exception as exc:
+                logger.error(
+                    "TradeManager error evaluating %s: %s",
+                    pos.token_id[:16],
+                    exc,
+                    exc_info=True,
+                )
+
+        return results
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _get_meta(self, pos: Position) -> PositionMeta:
+        """Return (or create) the PositionMeta for a position."""
+        if pos.token_id not in self._meta:
+            self._meta[pos.token_id] = PositionMeta(
+                token_id=pos.token_id,
+                high_water_mark=pos.current_price or pos.entry_price,
+            )
+        return self._meta[pos.token_id]
+
+    # Strategies that hold to resolution (no early exit management)
+    HOLD_TO_RESOLUTION = {"crypto_mean_reversion"}
+
+    # Partial exit: sell this fraction at the first profit target
+    PARTIAL_EXIT_FRACTION = 0.50   # Sell 50%
+    PARTIAL_EXIT_TRIGGER = 0.10    # At +10% PnL
+
+    def _evaluate_position(self, pos: Position) -> Optional[ExecutionResult]:
+        """
+        Run exit checks for a single position in priority order.
+
+        Priority: stop-loss > trailing stop > partial scale-out > take-profit > time exit.
+
+        Crypto mean-reversion positions are skipped (hold to resolution).
+        """
+        meta = self._get_meta(pos)
+
+        # Guard: don't attempt to exit the same position twice in one cycle
+        if meta.exit_attempted:
+            return None
+
+        current_price = pos.current_price
+        if current_price <= 0:
+            logger.debug(
+                "TradeManager: no current price for %s, skipping.", pos.token_id[:16]
+            )
+            return None
+
+        # Track original size for partial exit calculation
+        if meta.original_size <= 0:
+            meta.original_size = pos.size
+
+        # Update high-water-mark
+        if current_price > meta.high_water_mark:
+            meta.high_water_mark = current_price
+            logger.debug(
+                "New HWM for %s: %.4f", pos.token_id[:16], meta.high_water_mark
+            )
+
+        # Update trailing stop activation and trigger price
+        self._update_trailing_stop(pos, meta)
+
+        pnl_pct = pos.unrealised_pnl_pct / 100.0   # convert to decimal
+
+        # ── 1. Stop-loss (full exit) ───────────────────────────────────────
+        if pnl_pct <= -self.cfg.STOP_LOSS_PCT:
+            return self._exit_position(
+                pos,
+                meta,
+                reason=(
+                    f"Stop-loss triggered: pnl={pnl_pct:.2%} "
+                    f"<= -{self.cfg.STOP_LOSS_PCT:.2%}"
+                ),
+                order_type="FOK",
+            )
+
+        # ── 2. Trailing stop (closes remaining position) ──────────────────
+        if meta.trailing_stop_active and current_price <= meta.trailing_stop_price:
+            return self._exit_position(
+                pos,
+                meta,
+                reason=(
+                    f"Trailing stop hit: price={current_price:.4f} "
+                    f"<= stop={meta.trailing_stop_price:.4f} "
+                    f"(hwm={meta.high_water_mark:.4f})"
+                ),
+                order_type="FOK",
+            )
+
+        # ── 3. Partial scale-out: sell 50% at +10% ───────────────────────
+        if not meta.partial_exit_done and pnl_pct >= self.PARTIAL_EXIT_TRIGGER:
+            partial_size = round(pos.size * self.PARTIAL_EXIT_FRACTION, 4)
+            if partial_size >= 1.0:  # Only if meaningful size to sell
+                result = self._exit_position(
+                    pos,
+                    meta,
+                    reason=(
+                        f"Partial scale-out: pnl={pnl_pct:.2%} >= "
+                        f"{self.PARTIAL_EXIT_TRIGGER:.0%} | "
+                        f"selling {self.PARTIAL_EXIT_FRACTION:.0%} "
+                        f"({partial_size:.1f} of {pos.size:.1f} shares)"
+                    ),
+                    order_type="GTC",
+                    size_override=partial_size,
+                )
+                if result and result.success:
+                    meta.partial_exit_done = True
+                    # Allow further exits — don't keep exit_attempted True
+                    meta.exit_attempted = False
+                    logger.info(
+                        "Partial exit done for %s: sold %.1f, %.1f remaining",
+                        pos.token_id[:16],
+                        partial_size,
+                        pos.size - partial_size,
+                    )
+                return result
+
+        # ── 4. Take-profit (full exit at +15% for remaining shares) ──────
+        if pnl_pct >= self.cfg.TAKE_PROFIT_PCT:
+            return self._exit_position(
+                pos,
+                meta,
+                reason=(
+                    f"Take-profit: pnl={pnl_pct:.2%} "
+                    f">= {self.cfg.TAKE_PROFIT_PCT:.2%}"
+                ),
+                order_type="GTC",
+            )
+
+        # ── 5. Time-based exit ────────────────────────────────────────────
+        age_seconds = time.time() - pos.opened_at
+        if age_seconds >= self.cfg.MAX_HOLD_TIME:
+            return self._exit_position(
+                pos,
+                meta,
+                reason=(
+                    f"Time exit: position age={age_seconds / 3600:.1f}h "
+                    f">= max={self.cfg.MAX_HOLD_TIME / 3600:.1f}h"
+                ),
+                order_type="GTC",
+            )
+
+        logger.debug(
+            "Position %s OK | pnl=%.2f%% | age=%.1fh | hwm=%.4f | trailing=%s | partial=%s",
+            pos.token_id[:16],
+            pnl_pct * 100,
+            age_seconds / 3600,
+            meta.high_water_mark,
+            meta.trailing_stop_active,
+            meta.partial_exit_done,
+        )
+        return None
+
+    def _update_trailing_stop(self, pos: Position, meta: PositionMeta) -> None:
+        """
+        Activate the trailing stop once a position has gained enough, and
+        continuously update the trailing stop price as price rises.
+        """
+        gain_pct = (pos.current_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
+
+        if not meta.trailing_stop_active:
+            if gain_pct >= self.cfg.TRAILING_STOP_ACTIVATION:
+                meta.trailing_stop_active = True
+                meta.trailing_stop_price = meta.high_water_mark * (
+                    1.0 - self.cfg.TRAILING_STOP_PCT
+                )
+                logger.info(
+                    "Trailing stop ACTIVATED for %s | "
+                    "gain=%.2f%% | hwm=%.4f | stop=%.4f",
+                    pos.token_id[:16],
+                    gain_pct * 100,
+                    meta.high_water_mark,
+                    meta.trailing_stop_price,
+                )
+        else:
+            # Ratchet the stop up when a new HWM is set
+            new_stop = meta.high_water_mark * (1.0 - self.cfg.TRAILING_STOP_PCT)
+            if new_stop > meta.trailing_stop_price:
+                meta.trailing_stop_price = new_stop
+                logger.debug(
+                    "Trailing stop ratcheted for %s | stop=%.4f",
+                    pos.token_id[:16],
+                    meta.trailing_stop_price,
+                )
+
+    def _exit_position(
+        self,
+        pos: Position,
+        meta: PositionMeta,
+        reason: str,
+        order_type: str = "GTC",
+        size_override: Optional[float] = None,
+    ) -> Optional[ExecutionResult]:
+        """
+        Build a SELL TradeSignal and execute it, recording the attempt.
+
+        Args:
+            pos:        The Position to close.
+            meta:       The PositionMeta for this position.
+            reason:     Human-readable exit reason for logs and history.
+            order_type: "GTC" for limit, "FOK" for market/immediate.
+
+        Returns:
+            ExecutionResult from the executor, or None if execution fails.
+        """
+        meta.exit_attempted = True
+
+        # Use current market price, falling back to entry price
+        sell_price = pos.current_price if pos.current_price > 0 else pos.entry_price
+
+        exit_size = size_override if size_override is not None else pos.size
+        sell_signal = TradeSignal(
+            strategy="trade_manager",
+            market_id=pos.market_id,
+            token_id=pos.token_id,
+            side="SELL",
+            price=round(sell_price, 4),
+            size=round(exit_size, 4),
+            confidence=1.0,    # exits are always high-confidence
+            reason=reason,
+            order_type=order_type,
+        )
+
+        logger.info(
+            "EXIT [%s]: token=%s | side=%s | size=%.4f @ $%.4f | reason=%s",
+            order_type,
+            pos.token_id[:16],
+            "SELL",
+            exit_size,
+            sell_price,
+            reason,
+        )
+
+        try:
+            result = self.executor.execute(sell_signal)
+            if result.success:
+                logger.info(
+                    "Exit executed: %s | order_id=%s",
+                    pos.token_id[:16],
+                    result.order_id,
+                )
+                # Remove tracking meta so position isn't managed after exit
+                self._meta.pop(pos.token_id, None)
+            else:
+                logger.warning(
+                    "Exit order rejected for %s: %s",
+                    pos.token_id[:16],
+                    result.error,
+                )
+            return result
+        except Exception as exc:
+            logger.error(
+                "Failed to submit exit for %s: %s",
+                pos.token_id[:16],
+                exc,
+                exc_info=True,
+            )
+            return None

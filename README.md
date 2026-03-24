@@ -618,4 +618,3 @@ class MyStrategy(BaseStrategy):
 - The authors of this software accept no responsibility for financial losses.
 
 **Use at your own risk.**
-# perplexity-bot

@@ -1,0 +1,99 @@
+{
+  "strategy_weights": {
+    "arbitrage": 0.26279585838524777,
+    "copy_trading": 0.47361910647759686,
+    "signal_based": 0.2635850351371554
+  },
+  "tuned_params": {
+    "SIGNAL_MIN_EDGE": 0.01,
+    "TAKE_PROFIT_PCT": 0.15,
+    "STOP_LOSS_PCT": 0.1,
+    "MAX_HOLD_TIME": 86400.0,
+    "TRAILING_STOP_ACTIVATION": 0.1,
+    "TRAILING_STOP_PCT": 0.05,
+    "ARBITRAGE_MIN_EDGE": 0.02,
+    "WEIGHT_VOLUME_SPIKE": 0.3,
+    "WEIGHT_MOMENTUM": 0.25,
+    "WEIGHT_VALUE": 0.25,
+    "WEIGHT_SPREAD": 0.2
+  },
+  "baseline_params": {
+    "SIGNAL_MIN_EDGE": 0.01,
+    "TAKE_PROFIT_PCT": 0.15,
+    "STOP_LOSS_PCT": 0.1,
+    "MAX_HOLD_TIME": 86400.0,
+    "TRAILING_STOP_ACTIVATION": 0.1,
+    "TRAILING_STOP_PCT": 0.05,
+    "ARBITRAGE_MIN_EDGE": 0.02,
+    "WEIGHT_VOLUME_SPIKE": 0.3,
+    "WEIGHT_MOMENTUM": 0.25,
+    "WEIGHT_VALUE": 0.25,
+    "WEIGHT_SPREAD": 0.2
+  },
+  "performance_log": [
+    {
+      "timestamp": 1774302982.550048,
+      "cycle": 0,
+      "regime": "unknown",
+      "weights": {
+        "arbitrage": 0.28287363694676076,
+        "copy_trading": 0.433403255725257,
+        "signal_based": 0.2837231073279823
+      },
+      "strategies": {
+        "arbitrage": {
+          "trades": 0,
+          "win_rate": 0.0,
+          "pnl": 0.0,
+          "sharpe": 0.0
+        },
+        "copy_trading": {
+          "trades": 49,
+          "win_rate": 0.02,
+          "pnl": 0.4239,
+          "sharpe": 4.851
+        },
+        "signal_based": {
+          "trades": 0,
+          "win_rate": 0.0,
+          "pnl": 0.0,
+          "sharpe": 0.0
+        }
+      }
+    },
+    {
+      "timestamp": 1774306620.6258712,
+      "cycle": 1,
+      "regime": "unknown",
+      "weights": {
+        "arbitrage": 0.26279585838524777,
+        "copy_trading": 0.47361910647759686,
+        "signal_based": 0.2635850351371554
+      },
+      "strategies": {
+        "arbitrage": {
+          "trades": 0,
+          "win_rate": 0.0,
+          "pnl": 0.0,
+          "sharpe": 0.0
+        },
+        "copy_trading": {
+          "trades": 51,
+          "win_rate": 0.02,
+          "pnl": 0.4239,
+          "sharpe": 4.918
+        },
+        "signal_based": {
+          "trades": 0,
+          "win_rate": 0.0,
+          "pnl": 0.0,
+          "sharpe": 0.0
+        }
+      }
+    }
+  ],
+  "market_regime": "unknown",
+  "cycles_completed": 2,
+  "last_optimized": 1774306620.6239822,
+  "baseline_cumulative_pnl": 0.0
+}

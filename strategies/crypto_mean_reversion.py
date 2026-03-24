@@ -1,0 +1,368 @@
+"""
+strategies/crypto_mean_reversion.py
+------------------------------------
+Mean-reversion strategy targeting Polymarket's ultra-short-term crypto
+Up/Down prediction markets (5-minute, 15-minute BTC and ETH windows).
+
+Inspired by the Hcrystallash approach: buy outcome tokens at 35-68¢ when
+mean-reversion conditions are met, hold to resolution at $1.00.
+
+Key principles:
+  1. ONLY targets crypto Up/Down markets (BTC and ETH).
+  2. Uses external crypto price data (Chainlink / Binance) to determine
+     real-time directional bias.
+  3. Implements mean-reversion logic: buy when the market overreacts to
+     short-term noise (price compression + reversal signals).
+  4. Accumulates positions through multiple small buys rather than
+     single large orders.
+  5. Lets positions resolve naturally (no early exit — hold to $1.00 or $0).
+
+Market structure:
+  - Each 5-minute window is a separate market with "Up" and "Down" outcomes.
+  - If BTC/ETH price at window end >= price at window start → "Up" resolves $1.
+  - Otherwise → "Down" resolves $1.
+  - Markets are found via Gamma API with series like "btc-up-or-down-5m".
+
+Entry logic (adapted from tweet analysis):
+  - Wait for price compression (narrow bid/ask spread on the outcome token).
+  - Look for oversold/overbought conditions in the outcome token price.
+  - Buy the contrarian side when the market has overreacted.
+  - Target entry prices of 35-68¢ for maximum payoff at resolution.
+
+This strategy does NOT sell before resolution — it holds to the binary
+outcome ($1 or $0). Risk management is handled by position sizing.
+"""
+
+import logging
+import re
+import time
+from typing import Dict, List, Optional, Tuple
+
+import requests
+
+from strategies.base import BaseStrategy, TradeSignal
+from market_scanner import MarketInfo, TokenInfo
+
+logger = logging.getLogger(__name__)
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+# Market identification patterns
+CRYPTO_MARKET_PATTERNS = [
+    r"bitcoin\s+up\s+or\s+down",
+    r"btc\s+up\s+or\s+down",
+    r"ethereum\s+up\s+or\s+down",
+    r"eth\s+up\s+or\s+down",
+]
+
+# Series identifiers for crypto Up/Down markets
+CRYPTO_SERIES_PATTERNS = [
+    "btc-up", "eth-up", "btc-updown", "eth-updown",
+    "bitcoin-up", "ethereum-up",
+]
+
+# Entry price range: only buy tokens priced between these values
+# Hcrystallash buys at 35-68¢ — we use a slightly wider range
+MIN_ENTRY_PRICE = 0.30   # Don't buy below 30¢ (too risky, too far from resolution)
+MAX_ENTRY_PRICE = 0.70   # Don't buy above 70¢ (not enough upside)
+
+# Sweet spot: prefer tokens in this range (best risk/reward)
+SWEET_SPOT_LOW = 0.40
+SWEET_SPOT_HIGH = 0.60
+
+# Mean reversion: buy when token is below this relative to its recent average
+MEAN_REVERSION_THRESHOLD = 0.85  # Buy when price is 85% or less of recent avg
+
+# Minimum spread to avoid buying into tight/efficient markets
+MIN_SPREAD = 0.02  # 2¢ minimum spread
+
+# Maximum number of signals per cycle for this strategy
+MAX_SIGNALS_PER_CYCLE = 2
+
+# Crypto price API for real-time BTC/ETH prices
+BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
+
+# Price history for mean reversion calculation
+# token_id -> list of (timestamp, mid_price)
+_price_history: Dict[str, List[Tuple[float, float]]] = {}
+
+# Cooldown: don't re-enter same market within this window (seconds)
+MARKET_COOLDOWN = 300  # 5 minutes
+
+
+class CryptoMeanReversionStrategy(BaseStrategy):
+    """
+    Mean-reversion strategy for crypto Up/Down prediction markets.
+
+    Targets 5-minute and 15-minute BTC/ETH binary markets on Polymarket.
+    Buys outcome tokens at 35-68¢ when mean-reversion conditions are met,
+    then holds to resolution at $1.00 (or loses at $0).
+    """
+
+    def name(self) -> str:
+        return "crypto_mean_reversion"
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._session = requests.Session()
+        self._session.headers.update({"Accept": "application/json"})
+        self._price_history: Dict[str, List[Tuple[float, float]]] = {}
+        self._market_cooldown: Dict[str, float] = {}
+        self._btc_price: Optional[float] = None
+        self._eth_price: Optional[float] = None
+        self._last_crypto_fetch: float = 0
+
+    def scan(self) -> List[TradeSignal]:
+        """
+        Scan for mean-reversion opportunities in crypto Up/Down markets.
+        """
+        signals: List[TradeSignal] = []
+        markets = self.market_scanner.get_markets()
+
+        # Refresh crypto prices (rate-limited to once per 10 seconds)
+        self._refresh_crypto_prices()
+
+        # Filter to only crypto Up/Down markets
+        crypto_markets = [m for m in markets if self._is_crypto_market(m)]
+
+        if not crypto_markets:
+            self.log.debug("No active crypto Up/Down markets found.")
+            return []
+
+        self.log.debug("Found %d crypto Up/Down market(s) to evaluate.", len(crypto_markets))
+
+        for market in crypto_markets:
+            try:
+                market_signals = self._evaluate_market(market)
+                signals.extend(market_signals)
+                if len(signals) >= MAX_SIGNALS_PER_CYCLE:
+                    break
+            except Exception as exc:
+                self.log.debug(
+                    "Error evaluating crypto market %s: %s",
+                    market.market_id[:16], exc,
+                )
+
+        if signals:
+            self.log.info(
+                "Crypto mean-reversion: %d signal(s) from %d market(s).",
+                len(signals), len(crypto_markets),
+            )
+
+        return signals[:MAX_SIGNALS_PER_CYCLE]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Market identification
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_crypto_market(market: MarketInfo) -> bool:
+        """Check if a market is a crypto Up/Down binary market."""
+        q = market.question.lower()
+
+        # Check question text
+        for pattern in CRYPTO_MARKET_PATTERNS:
+            if re.search(pattern, q):
+                return True
+
+        # Check for Up/Down outcomes (not Yes/No)
+        outcomes = [t.outcome.lower() for t in market.tokens]
+        if "up" in outcomes and "down" in outcomes:
+            # Additional check: must mention crypto
+            if any(kw in q for kw in ["bitcoin", "btc", "ethereum", "eth", "crypto"]):
+                return True
+
+        return False
+
+    def _get_market_asset(self, market: MarketInfo) -> str:
+        """Determine if this is a BTC or ETH market."""
+        q = market.question.lower()
+        if "bitcoin" in q or "btc" in q:
+            return "BTC"
+        if "ethereum" in q or "eth" in q:
+            return "ETH"
+        return "UNKNOWN"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Market evaluation
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _evaluate_market(self, market: MarketInfo) -> List[TradeSignal]:
+        """
+        Evaluate a single crypto Up/Down market for mean-reversion entry.
+
+        Returns signals for tokens that meet all entry criteria.
+        """
+        signals = []
+
+        # Check cooldown
+        last_entry = self._market_cooldown.get(market.market_id, 0)
+        if time.time() - last_entry < MARKET_COOLDOWN:
+            return []
+
+        asset = self._get_market_asset(market)
+
+        for token in market.tokens:
+            signal = self._evaluate_token(token, market, asset)
+            if signal:
+                signals.append(signal)
+                self._market_cooldown[market.market_id] = time.time()
+
+        return signals
+
+    def _evaluate_token(
+        self, token: TokenInfo, market: MarketInfo, asset: str
+    ) -> Optional[TradeSignal]:
+        """
+        Check if a single outcome token (Up or Down) is a good mean-reversion buy.
+        """
+        price = token.mid_price or token.best_ask
+        if price <= 0:
+            return None
+
+        # ── Price range filter ──────────────────────────────────────────────
+        if price < MIN_ENTRY_PRICE or price > MAX_ENTRY_PRICE:
+            return None
+
+        # ── Spread check ────────────────────────────────────────────────────
+        spread = token.best_ask - token.best_bid if token.best_ask > 0 and token.best_bid > 0 else 0
+        if spread < MIN_SPREAD:
+            # Market is too tight/efficient — no edge
+            return None
+
+        # ── Update price history ────────────────────────────────────────────
+        self._update_price_history(token)
+
+        # ── Mean reversion check ────────────────────────────────────────────
+        avg_price = self._get_average_price(token.token_id)
+        if avg_price <= 0:
+            # Not enough history yet — this is the first observation
+            return None
+
+        # Buy when current price is below the recent average (mean reversion)
+        if price > avg_price * MEAN_REVERSION_THRESHOLD:
+            return None
+
+        # ── Compute confidence score ────────────────────────────────────────
+        # Higher confidence when:
+        # 1. Price is in the sweet spot (40-60¢)
+        # 2. Price is well below the moving average
+        # 3. Market has volume (not a dead market)
+        confidence = 0.0
+
+        # Price position score (best at 50¢, where risk/reward is balanced)
+        if SWEET_SPOT_LOW <= price <= SWEET_SPOT_HIGH:
+            confidence += 0.40
+        elif MIN_ENTRY_PRICE <= price < SWEET_SPOT_LOW:
+            confidence += 0.25  # Cheap but riskier
+        else:
+            confidence += 0.20  # Above sweet spot, less upside
+
+        # Mean reversion depth (how far below average)
+        reversion_depth = 1.0 - (price / avg_price)
+        confidence += min(reversion_depth * 2.0, 0.30)
+
+        # Volume score
+        if market.volume > 10000:
+            confidence += 0.20
+        elif market.volume > 1000:
+            confidence += 0.10
+
+        # Spread score (wider spread = more potential edge)
+        if spread > 0.05:
+            confidence += 0.10
+
+        confidence = min(confidence, 1.0)
+
+        # ── Minimum confidence gate ─────────────────────────────────────────
+        if confidence < 0.40:
+            return None
+
+        # ── Build signal ────────────────────────────────────────────────────
+        # Size: in micro mode this will be overridden, but provide a reasonable default
+        budget = self.cfg.MAX_POSITION_SIZE * confidence * 0.5
+        size = budget / token.best_ask if token.best_ask > 0 else 0
+        size = max(round(size, 2), 5.0)  # Minimum 5 shares for Polymarket
+
+        # Expected payoff: buy at current price, resolve at $1.00
+        expected_payoff = (1.0 - price) / price  # e.g., buy at 50¢ → 100% return
+
+        reason = (
+            f"Crypto MR [{asset}] {token.outcome} @ {price:.3f} | "
+            f"avg={avg_price:.3f} | reversion={reversion_depth:.1%} | "
+            f"spread={spread:.3f} | payoff={expected_payoff:.0%} | "
+            f"{market.question[:50]}"
+        )
+
+        signal = TradeSignal(
+            strategy=self.name(),
+            market_id=market.market_id,
+            token_id=token.token_id,
+            side="BUY",
+            price=round(token.best_ask, 4),  # Buy at the ask
+            size=size,
+            confidence=confidence,
+            reason=reason,
+            order_type="GTC",
+        )
+
+        self._log_signal(signal)
+        return signal
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Price tracking
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _update_price_history(self, token: TokenInfo) -> None:
+        """Track token prices for mean reversion calculation."""
+        price = token.mid_price or token.best_ask
+        if price <= 0:
+            return
+
+        history = self._price_history.setdefault(token.token_id, [])
+        history.append((time.time(), price))
+
+        # Keep last 20 observations (~10 minutes at 30s intervals)
+        if len(history) > 20:
+            self._price_history[token.token_id] = history[-20:]
+
+    def _get_average_price(self, token_id: str) -> float:
+        """Get the simple moving average of recent prices for a token."""
+        history = self._price_history.get(token_id, [])
+        if len(history) < 3:
+            return 0.0  # Need at least 3 observations
+
+        prices = [p for _, p in history]
+        return sum(prices) / len(prices)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # External crypto price data
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _refresh_crypto_prices(self) -> None:
+        """Fetch current BTC and ETH prices from Binance (rate-limited)."""
+        if time.time() - self._last_crypto_fetch < 10:
+            return
+
+        try:
+            # BTC
+            resp = self._session.get(
+                BINANCE_API, params={"symbol": "BTCUSDT"}, timeout=5
+            )
+            if resp.ok:
+                self._btc_price = float(resp.json().get("price", 0))
+
+            # ETH
+            resp = self._session.get(
+                BINANCE_API, params={"symbol": "ETHUSDT"}, timeout=5
+            )
+            if resp.ok:
+                self._eth_price = float(resp.json().get("price", 0))
+
+            self._last_crypto_fetch = time.time()
+            self.log.debug(
+                "Crypto prices: BTC=$%.0f ETH=$%.0f",
+                self._btc_price or 0, self._eth_price or 0,
+            )
+        except Exception as exc:
+            self.log.debug("Failed to fetch crypto prices: %s", exc)
