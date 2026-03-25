@@ -27,7 +27,18 @@ from typing import Dict, List, Optional
 
 import requests
 from web3 import Web3
-from web3.middleware import geth_poa_middleware, construct_sign_and_send_raw_middleware
+try:
+    # web3 v7+
+    from web3.middleware import ExtraDataToPOAMiddleware as poa_middleware
+    WEB3_V7 = True
+except ImportError:
+    # web3 v6
+    from web3.middleware import geth_poa_middleware as poa_middleware
+    WEB3_V7 = False
+try:
+    from web3.middleware import SignAndSendRawMiddlewareBuilder
+except ImportError:
+    SignAndSendRawMiddlewareBuilder = None
 
 from config import Config
 
@@ -90,13 +101,25 @@ class Redeemer:
         try:
             rpc_url = os.getenv("POLYGON_RPC_URL", POLYGON_RPC)
             self._w3 = Web3(Web3.HTTPProvider(rpc_url))
-            self._w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+            # POA middleware for Polygon
+            try:
+                self._w3.middleware_onion.inject(poa_middleware, layer=0)
+            except Exception:
+                pass  # Some web3 versions handle this differently
 
             # Set up signing with private key
             pk = self.cfg.PRIVATE_KEY
-            self._w3.middleware_onion.add(
-                construct_sign_and_send_raw_middleware(pk)
-            )
+            account = self._w3.eth.account.from_key(pk)
+            if SignAndSendRawMiddlewareBuilder:
+                self._w3.middleware_onion.inject(
+                    SignAndSendRawMiddlewareBuilder.build(account),
+                    layer=0,
+                )
+            else:
+                from web3.middleware import construct_sign_and_send_raw_middleware
+                self._w3.middleware_onion.add(
+                    construct_sign_and_send_raw_middleware(pk)
+                )
             account = self._w3.eth.account.from_key(pk)
             self._w3.eth.default_account = account.address
             self._wallet_address = account.address

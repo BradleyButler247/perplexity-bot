@@ -292,6 +292,23 @@ class Executor:
         # Enforce Polymarket's minimum order size
         if micro_size < self.MIN_ORDER_SIZE:
             micro_size = self.MIN_ORDER_SIZE
+
+        # HARD CAP: never exceed MICRO_TRADE_SIZE in dollar terms
+        # even if the minimum share count pushes the cost higher
+        actual_cost = micro_size * signal.price
+        if actual_cost > self.cfg.MICRO_TRADE_SIZE * 1.1:  # 10% tolerance
+            micro_size = self.cfg.MICRO_TRADE_SIZE / signal.price
+            if micro_size < self.MIN_ORDER_SIZE:
+                # Can't meet both the min share and max dollar constraint
+                # at this price point — skip the trade
+                logger.info(
+                    "[MICRO] Skipping: min shares ($%.2f) exceeds max trade size ($%.2f) at price $%.3f",
+                    self.MIN_ORDER_SIZE * signal.price,
+                    self.cfg.MICRO_TRADE_SIZE,
+                    signal.price,
+                )
+                return signal  # Return unmodified — balance check will reject it
+
         micro_size = round(micro_size, 6)
 
         overridden = dataclasses.replace(signal, size=micro_size)
