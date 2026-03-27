@@ -23,11 +23,13 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 
 from config import Config
 from execution import Executor, ExecutionResult
+from market_scanner import classify_market
 from position_tracker import Position, PositionTracker
 from strategies.base import TradeSignal
 
 if TYPE_CHECKING:
     from market_scanner import MarketScanner
+    from ai_probability_engine import AIProbabilityEngine
 
 logger = logging.getLogger("bot.trade_manager")
 
@@ -66,14 +68,22 @@ class TradeManager:
         executor: Executor,
         cfg: Config,
         market_scanner: Optional["MarketScanner"] = None,
+        ai_engine: Optional["AIProbabilityEngine"] = None,
     ) -> None:
         self.tracker = tracker
         self.executor = executor
         self.cfg = cfg
         self.market_scanner = market_scanner
+        self.ai_engine = ai_engine
 
         # token_id -> PositionMeta for trailing stop tracking
         self._meta: Dict[str, PositionMeta] = {}
+
+        # Bayesian re-evaluation cycle counter
+        self._cycle_count: int = 0
+
+        # Cache of AI probability estimates for open positions
+        self._ai_estimates: Dict[str, float] = {}  # market_id -> last probability
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -89,11 +99,21 @@ class TradeManager:
         Returns:
             List of ExecutionResult objects for any exits attempted.
         """
+        self._cycle_count += 1
+
         positions = [p for p in self.tracker.get_all_positions() if not p.resolved]
 
         if not positions:
             logger.debug("TradeManager: no open positions to manage.")
             return []
+
+        # Bayesian re-evaluation every N cycles (for AI-powered positions)
+        if (
+            self.ai_engine
+            and self.ai_engine.enabled
+            and self._cycle_count % self.cfg.REEVALUATE_INTERVAL == 0
+        ):
+            self._bayesian_reevaluate(positions)
 
         results: List[ExecutionResult] = []
 
@@ -125,12 +145,27 @@ class TradeManager:
             )
         return self._meta[pos.token_id]
 
-    # Strategies that hold to resolution (no early exit management)
-    HOLD_TO_RESOLUTION = {"crypto_mean_reversion"}
+    # Strategies that always hold to resolution regardless of config
+    ALWAYS_HOLD_TO_RESOLUTION = {"crypto_mean_reversion"}
 
     # Partial exit: sell this fraction at the first profit target
     PARTIAL_EXIT_FRACTION = 0.50   # Sell 50%
     PARTIAL_EXIT_TRIGGER = 0.10    # At +10% PnL
+
+    # Base rate estimates by category (v34)
+    # Rough historical base rates for how often "Yes" outcomes resolve true
+    _CATEGORY_BASE_RATES = {
+        "crypto": 0.45,       # Roughly 50/50 (up/down markets)
+        "sports": 0.35,       # Underdogs rarely win
+        "esports": 0.30,      # Even more volatile
+        "politics": 0.25,     # Incumbents/favorites dominate
+        "geopolitics": 0.15,  # Rare events
+        "finance": 0.20,      # Most predictions fail
+        "weather": 0.40,      # Forecasts are decent
+        "entertainment": 0.25,
+        "economics": 0.20,
+        "other": 0.30,
+    }
 
     def _evaluate_position(self, pos: Position) -> Optional[ExecutionResult]:
         """
@@ -222,8 +257,17 @@ class TradeManager:
                     )
                 return result
 
+        # ── v34: Hold-to-resolution check ──────────────────────────────────
+        # When HOLD_TO_RESOLUTION is enabled, skip TP/time exits unless EV
+        # has flipped negative (checked via Bayesian re-eval cache).
+        hold_override = (
+            self.cfg.HOLD_TO_RESOLUTION
+            and pnl_pct > -self.cfg.STOP_LOSS_PCT  # Not at stop-loss level
+            and not self._ev_is_negative(pos)       # EV hasn't flipped
+        )
+
         # ── 4. Take-profit (full exit at +15% for remaining shares) ──────
-        if pnl_pct >= self.cfg.TAKE_PROFIT_PCT:
+        if pnl_pct >= self.cfg.TAKE_PROFIT_PCT and not hold_override:
             return self._exit_position(
                 pos,
                 meta,
@@ -236,7 +280,7 @@ class TradeManager:
 
         # ── 5. Time-based exit ────────────────────────────────────────────
         age_seconds = time.time() - pos.opened_at
-        if age_seconds >= self.cfg.MAX_HOLD_TIME:
+        if age_seconds >= self.cfg.MAX_HOLD_TIME and not hold_override:
             return self._exit_position(
                 pos,
                 meta,
@@ -363,3 +407,90 @@ class TradeManager:
                 exc_info=True,
             )
             return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # v34: Base rate, hold-to-resolution, Bayesian re-evaluation
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def estimate_category_base_rate(self, market_category: str) -> float:
+        """
+        Return a rough base rate for a market category.
+
+        Used to check if a trade's category has a sufficiently high base rate
+        before entering.
+        """
+        return self._CATEGORY_BASE_RATES.get(market_category, 0.30)
+
+    def apply_base_rate_sizing(self, signal: TradeSignal) -> TradeSignal:
+        """
+        Apply base-rate rules to a trade signal before execution.
+
+        If the event category's historical base rate is below BASE_RATE_MIN,
+        reduce position size by BASE_RATE_SIZE_CUT.
+
+        Returns the (possibly modified) signal.
+        """
+        # Determine market category
+        category = "other"
+        if self.market_scanner:
+            market = self.market_scanner.get_market(signal.market_id)
+            if market:
+                category = classify_market(market.question)
+
+        base_rate = self.estimate_category_base_rate(category)
+
+        if base_rate < self.cfg.BASE_RATE_MIN:
+            original_size = signal.size
+            signal.size = round(signal.size * (1.0 - self.cfg.BASE_RATE_SIZE_CUT), 4)
+            logger.info(
+                "Base rate cut: category=%s rate=%.0f%% < %.0f%% | size %.2f -> %.2f",
+                category, base_rate * 100, self.cfg.BASE_RATE_MIN * 100,
+                original_size, signal.size,
+            )
+
+        return signal
+
+    def _ev_is_negative(self, pos: Position) -> bool:
+        """
+        Check if the Bayesian-updated EV for a position has turned negative.
+
+        Uses the cached AI estimate to compute EV.  If no estimate is cached,
+        returns False (don't exit).
+        """
+        est_prob = self._ai_estimates.get(pos.market_id)
+        if est_prob is None:
+            return False
+
+        # EV = prob * ($1 - entry) - (1 - prob) * entry
+        ev = est_prob * (1.0 - pos.entry_price) - (1.0 - est_prob) * pos.entry_price
+        return ev < 0
+
+    def _bayesian_reevaluate(self, positions: List[Position]) -> None:
+        """
+        Periodically re-evaluate AI-powered positions using Bayesian update.
+
+        If the updated probability flips the EV to negative, mark the
+        position for exit on the next check.
+        """
+        if not self.ai_engine or not self.market_scanner:
+            return
+
+        for pos in positions:
+            market = self.market_scanner.get_market(pos.market_id)
+            if not market:
+                continue
+
+            prior = self._ai_estimates.get(pos.market_id, pos.entry_price)
+            try:
+                updated = self.ai_engine.reevaluate_position(market, prior)
+                if updated is not None:
+                    self._ai_estimates[pos.market_id] = updated
+                    ev = updated * (1.0 - pos.entry_price) - (1.0 - updated) * pos.entry_price
+                    if ev < 0:
+                        logger.info(
+                            "Bayesian re-eval: EV flipped negative for %s "
+                            "(prob=%.1f%% entry=%.3f EV=%.4f). Flagging for exit.",
+                            pos.token_id[:16], updated * 100, pos.entry_price, ev,
+                        )
+            except Exception as exc:
+                logger.debug("Bayesian re-eval failed for %s: %s", pos.market_id[:16], exc)

@@ -26,10 +26,11 @@ from typing import Dict, List, Optional
 import requests
 
 from config import Config
+from constants import DATA_API
+from http_client import get_session
 
 logger = logging.getLogger(__name__)
 
-DATA_API = "https://data-api.polymarket.com"
 POSITIONS_FILE = "positions.json"
 
 
@@ -89,8 +90,7 @@ class PositionTracker:
         self.market_scanner = market_scanner
         self._positions: Dict[str, Position] = {}   # token_id -> Position
         self._realised_pnl: float = 0.0
-        self._session = requests.Session()
-        self._session.headers.update({"Accept": "application/json"})
+        self._session = get_session()
         self._wallet_address: Optional[str] = None
 
     # ─────────────────────────────────────────────────────────────────────────

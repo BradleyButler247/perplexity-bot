@@ -14,6 +14,7 @@ bot restarts.
 
 import csv
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -233,6 +234,57 @@ class TradeHistory:
             print()
 
         print(sep)
+
+    def compute_log_returns(self) -> Dict[str, float]:
+        """
+        Compute log returns for all completed round-trip trades.
+
+        Log return = ln(P_sell / P_buy)
+
+        Log returns sum correctly across positions and time periods,
+        making them preferable for multi-position P&L analysis.
+
+        Returns:
+            Dict with keys: total_log_return, avg_log_return, count,
+            arithmetic_return (for display).
+        """
+        by_token: Dict[str, List[TradeRecord]] = {}
+        for rec in self._records:
+            by_token.setdefault(rec.token_id, []).append(rec)
+
+        log_returns = []
+        arith_returns = []
+
+        for token_id, records in by_token.items():
+            buys = sorted([r for r in records if r.side == "BUY"], key=lambda r: r.timestamp)
+            sells = sorted([r for r in records if r.side == "SELL"], key=lambda r: r.timestamp)
+
+            for buy in buys:
+                # Find first sell after this buy
+                matched_sell = None
+                for sell in sells:
+                    if sell.timestamp > buy.timestamp:
+                        matched_sell = sell
+                        break
+
+                if matched_sell and buy.price > 0 and matched_sell.price > 0:
+                    log_r = math.log(matched_sell.price / buy.price)
+                    arith_r = (matched_sell.price - buy.price) / buy.price
+                    log_returns.append(log_r)
+                    arith_returns.append(arith_r)
+                    sells.remove(matched_sell)
+
+        total_log = sum(log_returns) if log_returns else 0.0
+        avg_log = total_log / len(log_returns) if log_returns else 0.0
+        total_arith = sum(arith_returns) if arith_returns else 0.0
+
+        return {
+            "total_log_return": total_log,
+            "avg_log_return": avg_log,
+            "count": len(log_returns),
+            "arithmetic_return": total_arith,
+            "avg_arithmetic_return": total_arith / len(arith_returns) if arith_returns else 0.0,
+        }
 
     def get_records(self, mode: Optional[str] = None, strategy: Optional[str] = None) -> List[TradeRecord]:
         """

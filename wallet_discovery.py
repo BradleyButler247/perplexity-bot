@@ -19,7 +19,9 @@ APIs used (all public, no auth):
   GET https://data-api.polymarket.com/closed-positions?user={wallet}
 """
 
+import datetime
 import logging
+import statistics
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -27,19 +29,27 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 from config import Config
+from constants import DATA_API, parse_timestamp
+from http_client import get_session
 
 logger = logging.getLogger("bot.wallet_discovery")
 
-DATA_API = "https://data-api.polymarket.com"
 
-# Weights for the composite score
-SCORE_WEIGHT_WIN_RATE    = 0.40
-SCORE_WEIGHT_PNL         = 0.30
-SCORE_WEIGHT_CONSISTENCY = 0.20
-SCORE_WEIGHT_VOLUME      = 0.10
+# Enhanced scoring weights (v34):
+# S(w) = α·PnL_realized + β·Consistency(t) + γ·Specialization(c) − δ·MaxDD
+SCORE_ALPHA_PNL         = 0.35
+SCORE_BETA_CONSISTENCY  = 0.25
+SCORE_GAMMA_SPECIAL     = 0.25
+SCORE_DELTA_DRAWDOWN    = 0.15
 
 # Maximum days since last trade to be considered "recently active"
-MAX_INACTIVE_DAYS = 7
+MAX_INACTIVE_DAYS = 14  # Increased from 7
+
+# Strict quality filters (v34)
+MIN_RESOLVED_TRADES = 80          # Up from 20
+MAX_SINGLE_TRADE_PNL_PCT = 0.30   # No single trade > 30% of total PnL
+AVG_ENTRY_PRICE_LOW = 0.25        # Average entry between 25c-65c
+AVG_ENTRY_PRICE_HIGH = 0.65
 
 
 @dataclass
@@ -56,6 +66,12 @@ class WalletProfile:
     score: float = 0.0          # Composite score [0.0 – 1.0]
     source_period: str = ""     # "WEEK" / "MONTH" from which this wallet was discovered
     source_category: str = ""   # Leaderboard category
+
+    # Enhanced scoring metrics (v34)
+    max_drawdown: float = 0.0           # Maximum peak-to-trough drawdown
+    specialization: float = 0.0         # Herfindahl index of category concentration
+    consistency: float = 0.0            # Inverse of monthly return std dev
+    category_scores: Dict[str, float] = field(default_factory=dict)  # category -> score
 
     # Bot-detection metrics
     bot_score: float = 0.0          # 0.0 = human, 1.0 = definitely a bot
@@ -99,8 +115,7 @@ class WalletDiscovery:
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self._session = requests.Session()
-        self._session.headers.update({"Accept": "application/json"})
+        self._session = get_session()
 
         # Cache: list of WalletProfile + timestamp of last discovery
         self._cache: List[WalletProfile] = []
@@ -151,6 +166,22 @@ class WalletDiscovery:
             List of wallet address strings, up to MAX_COPY_WALLETS.
         """
         return [w.proxy_wallet for w in self.discover(force=force)]
+
+    def get_wallet_categories(self, address: str) -> List[str]:
+        """
+        Return the best-performing categories for a wallet.
+
+        Categories are sorted by score descending.  Returns an empty list
+        if no category data is available for this wallet.
+        """
+        address = address.lower()
+        for w in self._cache:
+            if w.proxy_wallet == address and w.category_scores:
+                sorted_cats = sorted(
+                    w.category_scores.items(), key=lambda x: x[1], reverse=True
+                )
+                return [cat for cat, score in sorted_cats if score > 0]
+        return []
 
     # ─────────────────────────────────────────────────────────────────────────
     # Discovery logic
@@ -229,10 +260,12 @@ class WalletDiscovery:
         """
         Fetch closed positions and recent activity to compute quality metrics.
 
-        Applies quality filters:
-          - MIN_CLOSED_POSITIONS: at least N closed positions
+        Enhanced filters (v34):
+          - Minimum 80 resolved trades
+          - No single trade > 30% of total PnL
+          - Entry prices between 25c and 65c on average
+          - Active within last 14 days
           - MIN_WIN_RATE: win rate must meet threshold
-          - MAX_INACTIVE_DAYS: must have traded within the last 7 days
 
         Returns:
             Updated WalletProfile if the wallet qualifies, None if filtered out.
@@ -241,12 +274,13 @@ class WalletDiscovery:
 
         # ── Closed positions ────────────────────────────────────────────────
         closed = self._fetch_closed_positions(wallet)
-        if len(closed) < self.cfg.MIN_CLOSED_POSITIONS:
+
+        # v34: strict minimum of 80 resolved trades
+        min_trades = max(self.cfg.MIN_CLOSED_POSITIONS, MIN_RESOLVED_TRADES)
+        if len(closed) < min_trades:
             logger.debug(
                 "Wallet %s filtered: only %d closed positions (min=%d).",
-                wallet[:10],
-                len(closed),
-                self.cfg.MIN_CLOSED_POSITIONS,
+                wallet[:10], len(closed), min_trades,
             )
             return None
 
@@ -259,11 +293,31 @@ class WalletDiscovery:
         if win_rate < self.cfg.MIN_WIN_RATE:
             logger.debug(
                 "Wallet %s filtered: win_rate=%.1f%% < %.1f%%.",
-                wallet[:10],
-                win_rate * 100,
-                self.cfg.MIN_WIN_RATE * 100,
+                wallet[:10], win_rate * 100, self.cfg.MIN_WIN_RATE * 100,
             )
             return None
+
+        # ── v34: No single trade > 30% of total PnL ────────────────────────
+        pnls = self._extract_trade_pnls(closed)
+        total_pnl = sum(abs(p) for p in pnls) if pnls else 0
+        if total_pnl > 0 and pnls:
+            max_single = max(abs(p) for p in pnls)
+            if max_single / total_pnl > MAX_SINGLE_TRADE_PNL_PCT:
+                logger.debug(
+                    "Wallet %s filtered: single trade %.1f%% of total PnL.",
+                    wallet[:10], (max_single / total_pnl) * 100,
+                )
+                return None
+
+        # ── v34: Average entry price between 25c-65c ──────────────────────
+        avg_entry = self._compute_avg_entry_price(closed)
+        if avg_entry > 0:
+            if avg_entry < AVG_ENTRY_PRICE_LOW or avg_entry > AVG_ENTRY_PRICE_HIGH:
+                logger.debug(
+                    "Wallet %s filtered: avg entry=%.2f (want %.2f-%.2f).",
+                    wallet[:10], avg_entry, AVG_ENTRY_PRICE_LOW, AVG_ENTRY_PRICE_HIGH,
+                )
+                return None
 
         # ── Recent activity ─────────────────────────────────────────────────
         last_ts = self._fetch_last_trade_timestamp(wallet)
@@ -274,28 +328,124 @@ class WalletDiscovery:
             if days_inactive > MAX_INACTIVE_DAYS:
                 logger.debug(
                     "Wallet %s filtered: last trade %.1f days ago (max=%d).",
-                    wallet[:10],
-                    days_inactive,
-                    MAX_INACTIVE_DAYS,
+                    wallet[:10], days_inactive, MAX_INACTIVE_DAYS,
                 )
                 return None
+
+        # ── v34: Compute enhanced metrics ──────────────────────────────────
+        self._compute_enhanced_metrics(profile, closed, pnls)
 
         # ── Bot detection ──────────────────────────────────────────────────
         self._analyze_bot_behavior(profile)
 
         bot_tag = " [BOT]" if profile.is_likely_bot else ""
         logger.info(
-            "Wallet %s qualified | wr=%.1f%% (%d/%d) | closed=%d | pnl=$%.0f | bot=%.2f%s",
-            wallet[:10],
-            win_rate * 100,
-            wins,
-            total,
-            len(closed),
-            profile.pnl,
-            profile.bot_score,
-            bot_tag,
+            "Wallet %s qualified | wr=%.1f%% (%d/%d) | closed=%d | pnl=$%.0f | "
+            "dd=%.2f | spec=%.2f | cats=%s | bot=%.2f%s",
+            wallet[:10], win_rate * 100, wins, total, len(closed),
+            profile.pnl, profile.max_drawdown, profile.specialization,
+            list(profile.category_scores.keys())[:3],
+            profile.bot_score, bot_tag,
         )
         return profile
+
+    def _extract_trade_pnls(self, closed: List[dict]) -> List[float]:
+        """Extract individual trade PnLs from closed positions."""
+        pnls = []
+        for pos in closed:
+            pnl_val = pos.get("pnl") or pos.get("realizedPnl")
+            if pnl_val is not None:
+                try:
+                    pnls.append(float(pnl_val))
+                except (TypeError, ValueError):
+                    pass
+            else:
+                value = float(pos.get("value") or pos.get("currentValue") or 0)
+                cost = float(pos.get("initialValue") or pos.get("buyCost") or 0)
+                if cost > 0:
+                    pnls.append(value - cost)
+        return pnls
+
+    def _compute_avg_entry_price(self, closed: List[dict]) -> float:
+        """Compute the average entry price across closed positions."""
+        prices = []
+        for pos in closed:
+            price = pos.get("avgPrice") or pos.get("entryPrice") or pos.get("price")
+            if price is not None:
+                try:
+                    p = float(price)
+                    if 0 < p < 1:
+                        prices.append(p)
+                except (TypeError, ValueError):
+                    pass
+        return sum(prices) / len(prices) if prices else 0.0
+
+    def _compute_enhanced_metrics(
+        self, profile: WalletProfile, closed: List[dict], pnls: List[float]
+    ) -> None:
+        """Compute v34 enhanced scoring metrics: max drawdown, specialization, consistency, category scores."""
+        # ── Max drawdown ──────────────────────────────────────────────────
+        if pnls:
+            cumulative = 0.0
+            peak = 0.0
+            max_dd = 0.0
+            for p in pnls:
+                cumulative += p
+                if cumulative > peak:
+                    peak = cumulative
+                dd = peak - cumulative
+                if dd > max_dd:
+                    max_dd = dd
+            profile.max_drawdown = max_dd
+
+        # ── Category scores (per-category win rate) ───────────────────────
+        from market_scanner import classify_market
+        cat_wins: Dict[str, int] = {}
+        cat_total: Dict[str, int] = {}
+
+        for pos in closed:
+            question = pos.get("question") or pos.get("title") or ""
+            cat = classify_market(question) if question else "other"
+            cat_total[cat] = cat_total.get(cat, 0) + 1
+
+            pnl_val = pos.get("pnl") or pos.get("realizedPnl")
+            if pnl_val is not None:
+                try:
+                    if float(pnl_val) > 0:
+                        cat_wins[cat] = cat_wins.get(cat, 0) + 1
+                except (TypeError, ValueError):
+                    pass
+            else:
+                value = float(pos.get("value") or pos.get("currentValue") or 0)
+                cost = float(pos.get("initialValue") or pos.get("buyCost") or 0)
+                if value > cost and cost > 0:
+                    cat_wins[cat] = cat_wins.get(cat, 0) + 1
+
+        for cat, total in cat_total.items():
+            if total >= 5:  # Need at least 5 trades in a category
+                wr = cat_wins.get(cat, 0) / total
+                profile.category_scores[cat] = round(wr, 3)
+
+        # ── Specialization (Herfindahl index) ─────────────────────────────
+        total_trades = sum(cat_total.values())
+        if total_trades > 0:
+            hhi = sum((n / total_trades) ** 2 for n in cat_total.values())
+            profile.specialization = hhi  # Higher = more focused
+
+        # ── Consistency (inverse of monthly return std dev) ───────────────
+        if len(pnls) >= 10:
+
+            # Approximate monthly buckets (group ~20 trades per "month")
+            bucket_size = max(len(pnls) // 6, 5)
+            monthly_returns = []
+            for i in range(0, len(pnls), bucket_size):
+                chunk = pnls[i:i + bucket_size]
+                monthly_returns.append(sum(chunk))
+            if len(monthly_returns) >= 2:
+                std = statistics.stdev(monthly_returns)
+                mean = statistics.mean(monthly_returns)
+                # Consistency: lower std relative to mean = better
+                profile.consistency = 1.0 / (1.0 + std / (abs(mean) + 1.0))
 
     def _analyze_bot_behavior(self, profile: WalletProfile) -> None:
         """
@@ -310,7 +460,6 @@ class WalletDiscovery:
 
         Updates the profile's bot_score and is_likely_bot fields.
         """
-        import statistics
 
         wallet = profile.proxy_wallet
 
@@ -325,7 +474,7 @@ class WalletDiscovery:
         timestamps = []
         sizes = []
         for t in trades:
-            ts = _parse_timestamp(t)
+            ts = parse_timestamp(t)
             if ts > 0:
                 timestamps.append(ts)
             size = float(t.get("size") or t.get("amount") or t.get("value") or 0)
@@ -378,7 +527,7 @@ class WalletDiscovery:
         # Humans typically trade 8-16 hours/day; bots trade 20-24 hours
         hours_active = set()
         for ts in timestamps:
-            import datetime
+
             dt = datetime.datetime.utcfromtimestamp(ts)
             hours_active.add(dt.hour)
 
@@ -435,15 +584,11 @@ class WalletDiscovery:
 
     def _score_wallets(self, wallets: List[WalletProfile]) -> List[WalletProfile]:
         """
-        Assign a composite [0, 1] score to each wallet.
+        Assign a composite [0, 1] score using the enhanced formula (v34):
 
-        Scoring formula prioritizes profitable bots:
-          score = 0.25 * normalised_win_rate
-                + 0.20 * normalised_pnl
-                + 0.15 * normalised_consistency    (closed position count)
-                + 0.10 * normalised_volume
-                + 0.30 * bot_score                 (bots get priority)
+          S(w) = α·PnL_realized + β·Consistency(t) + γ·Specialization(c) − δ·MaxDD
 
+        Where α=0.35, β=0.25, γ=0.25, δ=0.15
         Normalisation is min-max within the candidate set.
         """
         if not wallets:
@@ -456,24 +601,25 @@ class WalletDiscovery:
                 return [0.5] * len(values)
             return [(v - lo) / (hi - lo) for v in values]
 
-        win_rates   = [w.win_rate for w in wallets]
-        pnls        = [w.pnl for w in wallets]
-        consistencies = [float(w.closed_positions) for w in wallets]
-        volumes     = [w.volume for w in wallets]
+        pnls            = [w.pnl for w in wallets]
+        consistencies   = [w.consistency for w in wallets]
+        specializations = [w.specialization for w in wallets]
+        drawdowns       = [w.max_drawdown for w in wallets]
 
-        norm_wr  = _normalise(win_rates)
-        norm_pnl = _normalise(pnls)
-        norm_con = _normalise(consistencies)
-        norm_vol = _normalise(volumes)
+        norm_pnl    = _normalise(pnls)
+        norm_con    = _normalise(consistencies)
+        norm_spec   = _normalise(specializations)
+        norm_dd     = _normalise(drawdowns)
 
         for i, wallet in enumerate(wallets):
             wallet.score = (
-                0.25 * norm_wr[i]
-                + 0.20 * norm_pnl[i]
-                + 0.15 * norm_con[i]
-                + 0.10 * norm_vol[i]
-                + 0.30 * wallet.bot_score
+                SCORE_ALPHA_PNL * norm_pnl[i]
+                + SCORE_BETA_CONSISTENCY * norm_con[i]
+                + SCORE_GAMMA_SPECIAL * norm_spec[i]
+                - SCORE_DELTA_DRAWDOWN * norm_dd[i]
             )
+            # Clamp to [0, 1]
+            wallet.score = max(0.0, min(1.0, wallet.score))
 
         return wallets
 
@@ -557,7 +703,7 @@ class WalletDiscovery:
             resp.raise_for_status()
             trades = resp.json()
             if isinstance(trades, list) and trades:
-                return _parse_timestamp(trades[0])
+                return parse_timestamp(trades[0])
             return 0.0
         except requests.RequestException as exc:
             logger.debug("Activity API failed for %s: %s", wallet[:10], exc)
@@ -622,22 +768,3 @@ class WalletDiscovery:
         win_rate = wins / total if total > 0 else 0.0
         return win_rate, wins, total
 
-
-def _parse_timestamp(trade: dict) -> float:
-    """
-    Extract a Unix timestamp (seconds) from an activity record.
-
-    Handles multiple common field names and both seconds and milliseconds.
-    """
-    for key in ("timestamp", "createdAt", "created_at", "time", "ts"):
-        val = trade.get(key)
-        if val:
-            try:
-                ts = float(val)
-                # Milliseconds if value is larger than year 2100 in seconds
-                if ts > 4_102_444_800:
-                    ts /= 1000.0
-                return ts
-            except (TypeError, ValueError):
-                continue
-    return 0.0

@@ -38,10 +38,15 @@ import re
 import time
 from typing import Dict, List, Optional, Tuple
 
-import requests
-
+from http_client import get_session
 from strategies.base import BaseStrategy, TradeSignal
 from market_scanner import MarketInfo, TokenInfo
+
+try:
+    from binance_indicators import BinanceIndicators, CryptoSignals
+    HAS_BINANCE = True
+except ImportError:
+    HAS_BINANCE = False
 
 logger = logging.getLogger(__name__)
 
@@ -102,15 +107,25 @@ class CryptoMeanReversionStrategy(BaseStrategy):
     def name(self) -> str:
         return "crypto_mean_reversion"
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, binance_indicators=None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._session = requests.Session()
-        self._session.headers.update({"Accept": "application/json"})
+        self._session = get_session()
         self._price_history: Dict[str, List[Tuple[float, float]]] = {}
         self._market_cooldown: Dict[str, float] = {}
         self._btc_price: Optional[float] = None
         self._eth_price: Optional[float] = None
         self._last_crypto_fetch: float = 0
+
+        # Binance real-time indicators
+        self._binance = binance_indicators
+        if self._binance is None and HAS_BINANCE:
+            try:
+                self._binance = BinanceIndicators()
+                self._binance.start()
+                self.log.info("Binance indicators started for crypto strategy.")
+            except Exception as exc:
+                self.log.warning("Binance indicators unavailable: %s", exc)
+                self._binance = None
 
     def scan(self) -> List[TradeSignal]:
         """
@@ -244,35 +259,75 @@ class CryptoMeanReversionStrategy(BaseStrategy):
             return None
 
         # ── Compute confidence score ────────────────────────────────────────
-        # Higher confidence when:
-        # 1. Price is in the sweet spot (40-60¢)
-        # 2. Price is well below the moving average
-        # 3. Market has volume (not a dead market)
+        # Combines polymarket price analysis with Binance order flow indicators
         confidence = 0.0
 
         # Price position score (best at 50¢, where risk/reward is balanced)
         if SWEET_SPOT_LOW <= price <= SWEET_SPOT_HIGH:
-            confidence += 0.40
+            confidence += 0.25
         elif MIN_ENTRY_PRICE <= price < SWEET_SPOT_LOW:
-            confidence += 0.25  # Cheap but riskier
+            confidence += 0.15
         else:
-            confidence += 0.20  # Above sweet spot, less upside
+            confidence += 0.10
 
         # Mean reversion depth (how far below average)
         reversion_depth = 1.0 - (price / avg_price)
-        confidence += min(reversion_depth * 2.0, 0.30)
+        confidence += min(reversion_depth * 2.0, 0.20)
 
         # Volume score
         if market.volume > 10000:
-            confidence += 0.20
-        elif market.volume > 1000:
             confidence += 0.10
+        elif market.volume > 1000:
+            confidence += 0.05
+
+        # ── Binance indicator boost ────────────────────────────────────────
+        # Use real-time order flow to confirm or reject the mean reversion
+        binance_boost = 0.0
+        binance_info = ""
+        if self._binance:
+            try:
+                signals = self._binance.get_signals(asset)
+                binance_info = f"trend={signals.trend_label} RSI={signals.rsi:.0f} OBI={signals.obi:+.2f}"
+
+                # Check if Binance confirms our direction
+                is_buying_up = token.outcome.lower() == "up"
+                is_buying_down = token.outcome.lower() == "down"
+
+                if is_buying_up and signals.trend_label == "BULLISH":
+                    binance_boost += 0.20  # Binance confirms upward move
+                elif is_buying_down and signals.trend_label == "BEARISH":
+                    binance_boost += 0.20  # Binance confirms downward move
+                elif is_buying_up and signals.trend_label == "BEARISH":
+                    binance_boost -= 0.15  # Binance contradicts — reduce confidence
+                elif is_buying_down and signals.trend_label == "BULLISH":
+                    binance_boost -= 0.15  # Binance contradicts
+
+                # RSI confirmation
+                if is_buying_up and signals.rsi < 30:
+                    binance_boost += 0.10  # Oversold = bounce likely
+                elif is_buying_down and signals.rsi > 70:
+                    binance_boost += 0.10  # Overbought = drop likely
+
+                # OBI confirmation (order book pressure)
+                if is_buying_up and signals.obi > 0.3:
+                    binance_boost += 0.05  # Strong buy pressure
+                elif is_buying_down and signals.obi < -0.3:
+                    binance_boost += 0.05  # Strong sell pressure
+
+                # MACD divergence (strong mean reversion signal)
+                if signals.macd_divergence:
+                    binance_boost += 0.10
+
+            except Exception as exc:
+                self.log.debug("Binance indicator error: %s", exc)
+
+        confidence += binance_boost
 
         # Spread score (wider spread = more potential edge)
         if spread > 0.05:
-            confidence += 0.10
+            confidence += 0.05
 
-        confidence = min(confidence, 1.0)
+        confidence = max(0.0, min(confidence, 1.0))
 
         # ── Minimum confidence gate ─────────────────────────────────────────
         if confidence < 0.40:
@@ -287,10 +342,12 @@ class CryptoMeanReversionStrategy(BaseStrategy):
         # Expected payoff: buy at current price, resolve at $1.00
         expected_payoff = (1.0 - price) / price  # e.g., buy at 50¢ → 100% return
 
+        bi_str = f"{binance_info} | " if binance_info else ""
         reason = (
             f"Crypto MR [{asset}] {token.outcome} @ {price:.3f} | "
             f"avg={avg_price:.3f} | reversion={reversion_depth:.1%} | "
             f"spread={spread:.3f} | payoff={expected_payoff:.0%} | "
+            f"{bi_str}"
             f"{market.question[:50]}"
         )
 

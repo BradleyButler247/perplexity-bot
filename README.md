@@ -1,6 +1,6 @@
 # Polymarket Multi-Strategy Trading Bot
 
-A production-ready, modular Python trading bot for [Polymarket](https://polymarket.com) (Polygon network).  It runs three independent strategies simultaneously with adaptive self-learning and can be deployed locally or on a remote VPS.
+A production-ready, modular Python trading bot for [Polymarket](https://polymarket.com) (Polygon network).  It runs ten independent strategies simultaneously with adaptive self-learning, Bayesian position re-evaluation, and can be deployed locally or on a remote VPS.
 
 ---
 
@@ -20,6 +20,7 @@ A production-ready, modular Python trading bot for [Polymarket](https://polymark
 12. [Architecture](#architecture)
 13. [Adding a New Strategy](#adding-a-new-strategy)
 14. [Risk Warnings](#risk-warnings)
+15. [Changelog](#changelog)
 
 ---
 
@@ -59,11 +60,45 @@ Scores markets across four weighted signals:
 
 If the composite score exceeds `SIGNAL_MIN_EDGE` (default 5%), the bot places a GTC limit order 1 cent above the best ask.
 
+### Strategy 4 — Crypto Mean Reversion (`crypto_mean_reversion`)
+
+Targets short-duration crypto Up/Down markets (e.g. "Will BTC go up in the next 5 minutes?"). Uses Binance kline data to detect overextended moves and trades the reversion.
+
+### Strategy 5 — Contrarian Extreme (`contrarian_extreme`)
+
+Fades markets priced at extremes (90%+ or sub-10%). These prices imply near-certainty, but surprise outcomes yield asymmetric payoffs.
+
+### Strategy 6 — AI-Powered (`ai_powered`)
+
+Uses Claude to estimate true probabilities for Polymarket markets, then trades when the market price diverges by more than `AI_MIN_EDGE` (default 8%). Evaluates up to 10 markets per cycle. Requires `ANTHROPIC_API_KEY`.
+
+### Strategy 7 — Sports Momentum (`sports_momentum`)
+
+Detects live sports event momentum from rapid price/volume movements and rides the trend with tight trailing stops.
+
+### Strategy 8 — Cross-Market Arbitrage (`cross_market_arb`)
+
+Identifies pricing inconsistencies across related event groups using KL-divergence and temporal consistency checks.
+
+### Strategy 9 — Weather Forecast Arbitrage (`weather_forecast_arb`)
+
+Compares NOAA/Open-Meteo forecast data against Polymarket weather market prices to find mispriced weather outcomes.
+
+### Strategy 10 — LP Rewards (`lp_rewards`) *(v34)*
+
+Earns liquidity provider rewards by placing bid/ask limit orders around the midpoint on high-liquidity markets.
+
+The bot:
+1. Fetches reward-eligible markets from the Gamma API.
+2. Allocates `LP_CAPITAL_PCT` (default 20%) of bankroll across up to `LP_MAX_MARKETS` markets.
+3. Places bid and ask orders at midpoint ± 2¢ spread.
+4. Refreshes orders every `LP_REFRESH_INTERVAL` seconds (default 300s) to stay near midpoint.
+
 ---
 
 ## Prerequisites
 
-- **Python 3.9+**
+- **Python 3.10+** (3.12 recommended)
 - **Polymarket account** with a funded wallet (USDC on Polygon)
 - **Private key** for your trading wallet (see below)
 - Internet access to reach Polymarket APIs
@@ -225,16 +260,19 @@ Instead of manually specifying a `TARGET_WALLET` to copy, the bot can automatica
 ### How it works
 
 1. Fetches the top traders from the leaderboard API across multiple time periods (WEEK and MONTH) and categories.
-2. For each candidate, fetches their closed positions to compute:
-   - **Win rate** (profitable closes / total closes)
-   - **Closed position count** (minimum `MIN_CLOSED_POSITIONS` to filter out luck)
-   - **Recent activity** (must have traded in the last 7 days)
-3. Scores each wallet using a composite formula:
-   - Win rate: 40%
-   - P&L: 30%
-   - Consistency (closed position count): 20%
-   - Volume: 10%
-4. Returns the top `MAX_COPY_WALLETS` wallets to the copy-trading strategy.
+2. For each candidate, fetches their closed positions and applies **strict filters** *(v34)*:
+   - Minimum **80 resolved trades** (filters out luck)
+   - No single trade > 30% of total PnL (filters out one-hit wonders)
+   - Average entry price between 25¢–65¢ (filters out extreme-price gamblers)
+   - Active within the last **14 days**
+3. Scores each wallet using an enhanced composite formula *(v34)*:
+   - `S(w) = α·PnL + β·Consistency + γ·Specialization − δ·MaxDD`
+   - PnL (α=0.35): Total realized profit, normalized
+   - Consistency (β=0.25): Inverse standard deviation of monthly returns
+   - Specialization (γ=0.25): Herfindahl index of category distribution (focused traders score higher)
+   - Max Drawdown (δ=0.15): Peak-to-trough drawdown penalty
+4. **Category-locking** *(v34)*: Tracks per-category performance for each wallet. Copy-trading only mirrors trades in categories where the wallet has demonstrated strength.
+5. Returns the top `MAX_COPY_WALLETS` wallets to the copy-trading strategy.
 
 Discovery results are cached for `WALLET_DISCOVERY_INTERVAL` seconds (default 6 hours) to avoid excessive API calls.
 
@@ -256,7 +294,19 @@ TARGET_WALLET=                # Leave blank to use auto-discovery
 
 ## Trade Management
 
-The `TradeManager` monitors all open positions each cycle and automatically exits positions based on configurable rules.  This enforces short-term trading discipline — the bot is designed to trade, not hold to market resolution.
+The `TradeManager` monitors all open positions each cycle and automatically exits positions based on configurable rules.
+
+### Hold-to-Resolution Mode *(v34)*
+
+When `HOLD_TO_RESOLUTION=true` (default), the bot prefers holding positions to market resolution rather than taking early exits. Take-profit and time-based exits are skipped unless the Bayesian re-evaluation determines that expected value has turned negative. Stat: held-to-resolution trades average +74% profit vs +18% for early exits.
+
+### Bayesian Re-evaluation *(v34)*
+
+Every `REEVALUATE_INTERVAL` cycles (default 10), the bot uses Claude to re-evaluate open AI-powered positions with Bayes' theorem: `P(H|E) = P(E|H) × P(H) / P(E)`. If the updated probability shows negative EV, the position is flagged for exit regardless of hold-to-resolution mode.
+
+### Base Rate Sizing *(v34)*
+
+Before executing any BUY signal, the bot checks the market's category base rate. If the category has a historical base rate below `BASE_RATE_MIN` (default 12%), position size is reduced by `BASE_RATE_SIZE_CUT` (default 50%).
 
 ### Exit rules (evaluated in priority order)
 
@@ -264,8 +314,8 @@ The `TradeManager` monitors all open positions each cycle and automatically exit
 |----------|------|---------|-------------|
 | 1 | **Stop-loss** | -10% | Submit a FOK (market) sell order immediately when unrealised P&L drops below threshold |
 | 2 | **Trailing stop** | 5% retracement | Once a position gains 10%+, set a trailing stop that moves with the price and triggers on a 5% pullback from peak |
-| 3 | **Take-profit** | +15% | Submit a GTC (limit) sell order when unrealised P&L exceeds the threshold |
-| 4 | **Time exit** | 24 hours | Force-close any position that has been open longer than `MAX_HOLD_TIME` seconds |
+| 3 | **Take-profit** | +15% | Submit a GTC (limit) sell order when unrealised P&L exceeds the threshold (skipped if `HOLD_TO_RESOLUTION=true` and EV is positive) |
+| 4 | **Time exit** | 24 hours | Force-close any position that has been open longer than `MAX_HOLD_TIME` seconds (skipped if `HOLD_TO_RESOLUTION=true` and EV is positive) |
 
 ### Configuration
 
@@ -275,6 +325,10 @@ STOP_LOSS_PCT=0.10            # Stop loss at -10%
 MAX_HOLD_TIME=86400           # Exit after 24 hours (in seconds)
 TRAILING_STOP_ACTIVATION=0.10 # Activate trailing stop after +10% gain
 TRAILING_STOP_PCT=0.05        # Trailing stop triggers on 5% pullback from peak
+HOLD_TO_RESOLUTION=true       # Prefer holding to resolution (v34)
+REEVALUATE_INTERVAL=10        # Re-evaluate AI positions every N cycles (v34)
+BASE_RATE_MIN=0.12            # Minimum base rate for full sizing (v34)
+BASE_RATE_SIZE_CUT=0.50       # Size cut for low base rate categories (v34)
 ```
 
 ### Trailing stop example
@@ -295,7 +349,7 @@ Every executed trade (paper, micro, or live) is recorded to `trade_history.csv` 
 | Column | Description |
 |--------|-------------|
 | `timestamp` | Unix timestamp of the trade |
-| `strategy` | Strategy that generated the signal (`arbitrage`, `copy_trading`, `signal_based`, `trade_manager`) |
+| `strategy` | Strategy that generated the signal (`arbitrage`, `copy_trading`, `signal_based`, `crypto_mean_reversion`, `contrarian_extreme`, `ai_powered`, `sports_momentum`, `cross_market_arb`, `weather_forecast_arb`, `lp_rewards`, `trade_manager`) |
 | `market_id` | Polymarket condition ID |
 | `token_id` | Outcome token ID |
 | `side` | `BUY` or `SELL` |
@@ -498,18 +552,31 @@ polymarket-bot/
 ├── config.py             ← Typed config loaded from .env
 ├── logger_setup.py       ← Structured logging (console + rotating file)
 ├── client_manager.py     ← ClobClient singleton + L2 credential init
+├── http_client.py        ← Shared HTTP session pool (v34)
 │
-├── market_scanner.py     ← Gamma API market discovery + CLOB enrichment
+├── market_scanner.py     ← Gamma API market discovery + classify_market()
 │   └── MarketScanner     ← Caches MarketInfo with TTL
 │
 ├── websocket_manager.py  ← Real-time WebSocket for market + user channels
 │   └── WebSocketManager  ← Async; runs in background thread
 │
+├── ai_probability_engine.py ← Claude-powered probability estimation + Bayesian re-eval
+├── binance_indicators.py    ← Binance kline data for crypto strategies
+├── news_aggregator.py       ← News feed aggregation for AI context
+├── price_history.py         ← Shared price history tracker (v34)
+│
 ├── strategies/
-│   ├── base.py           ← BaseStrategy ABC + TradeSignal dataclass
-│   ├── arbitrage.py      ← Sum-to-one arb (FOK orders)
-│   ├── copy_trading.py   ← Mirror target wallet(s); uses WalletDiscovery
-│   └── signal_based.py   ← Volume/momentum/value/spread composite
+│   ├── base.py              ← BaseStrategy ABC + TradeSignal dataclass
+│   ├── arbitrage.py         ← Sum-to-one arb (FOK orders)
+│   ├── copy_trading.py      ← Mirror wallet(s) with category-locking (v34)
+│   ├── signal_based.py      ← Volume/momentum/value/spread composite
+│   ├── crypto_mean_reversion.py ← Mean-reversion on crypto Up/Down markets
+│   ├── contrarian_extreme.py    ← Fade extreme prices (90%+)
+│   ├── ai_powered.py           ← Claude-powered probability vs market price
+│   ├── sports_momentum.py      ← Live sports event momentum trading
+│   ├── cross_market_arb.py     ← KL-divergence cross-event arbitrage
+│   ├── weather_forecast_arb.py ← NOAA/Open-Meteo vs market weather prices
+│   └── lp_rewards.py           ← LP rewards market-making (v34)
 │
 ├── execution.py          ← Order building, slippage check, submission
 │   └── Executor          ← Wraps py-clob-client; paper/micro/live modes
@@ -520,20 +587,24 @@ polymarket-bot/
 ├── position_tracker.py   ← Open positions, P&L, persistence (JSON)
 │   └── PositionTracker
 │
-├── trade_manager.py      ← NEW: Position exit logic (TP/SL/trailing/time)
+├── trade_manager.py      ← Position exits + Bayesian re-eval + base rate sizing (v34)
 │   └── TradeManager      ← Called each cycle; closes positions automatically
 │
-├── trade_history.py      ← NEW: Persistent CSV trade log + analytics
+├── trade_history.py      ← Persistent CSV trade log + log returns (v34)
 │   └── TradeHistory      ← Records all trades; prints report on shutdown
 │
-├── wallet_discovery.py   ← Auto-discover profitable wallets
+├── wallet_discovery.py   ← Enhanced wallet scoring + category tracking (v34)
 │   └── WalletDiscovery   ← Leaderboard API; scores and ranks traders
 │
-├── strategy_optimizer.py ← NEW: Self-learning adaptive engine
+├── strategy_optimizer.py ← Self-learning adaptive engine
 │   └── StrategyOptimizer ← Analyses trade history; tunes weights & params
+│
+├── redeemer.py           ← Auto-redeem resolved positions
 │
 ├── .env.example          ← Config template
 ├── requirements.txt      ← Python dependencies
+├── CHANGELOG.md          ← Version changelog
+├── ROADMAP.md            ← Future development plans
 ├── trade_history.csv     ← Auto-created: persistent trade log (all modes)
 ├── optimizer_state.json  ← Auto-created: optimizer state (survives restarts)
 └── logs/
@@ -618,3 +689,9 @@ class MyStrategy(BaseStrategy):
 - The authors of this software accept no responsibility for financial losses.
 
 **Use at your own risk.**
+
+---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a detailed list of changes in each version.

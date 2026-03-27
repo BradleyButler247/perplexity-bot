@@ -76,6 +76,28 @@ class Config:
     OPTIMIZER_MAX_SHIFT: float = 0.15    # Max 15% parameter change per cycle
     OPTIMIZER_LOOKBACK: int = 200        # Analyse last N trades
 
+    # ── LP Rewards Strategy ─────────────────────────────────────────────────
+    LP_ENABLED: bool = True
+    LP_CAPITAL_PCT: float = 0.20         # 20% of bankroll for LP
+    LP_MAX_MARKETS: int = 5
+    LP_REFRESH_INTERVAL: int = 300       # 5 minutes
+
+    # ── Base Rate Rules ──────────────────────────────────────────────────
+    BASE_RATE_MIN: float = 0.12          # 12% minimum base rate
+    BASE_RATE_SIZE_CUT: float = 0.50     # Cut size by 50% if below threshold
+    HOLD_TO_RESOLUTION: bool = True      # Prefer holding to resolution
+
+    # ── Drawdown / consecutive-loss circuit breaker ────────────────────
+    MAX_DAILY_DRAWDOWN_PCT: float = 0.05   # 5% of bankroll max daily loss
+    MAX_CONSECUTIVE_LOSSES: int = 3        # Pause after N consecutive losses
+
+    # ── Whale / large trade detection ────────────────────────────────
+    WHALE_MIN_TRADE_USD: float = 5000.0    # Minimum USD for whale detection
+    WHALE_LOOKBACK_MINUTES: int = 10       # Minutes to look back for spikes
+
+    # ── Bayesian Re-evaluation ───────────────────────────────────────────
+    REEVALUATE_INTERVAL: int = 10        # Every N cycles
+
     # ── Bot behaviour ─────────────────────────────────────────────────────
     POLL_INTERVAL: int = 30
     LOG_LEVEL: str = "INFO"
@@ -165,6 +187,30 @@ class Config:
         self.MAX_COPY_WALLETS = int(
             os.getenv("MAX_COPY_WALLETS", str(self.MAX_COPY_WALLETS))
         )
+
+        # ── LP Rewards Strategy ──────────────────────────────────────────
+        lp_enabled_env = os.getenv("LP_ENABLED", "true").strip().lower()
+        self.LP_ENABLED = lp_enabled_env in ("1", "true", "yes")
+        self.LP_CAPITAL_PCT = float(os.getenv("LP_CAPITAL_PCT", str(self.LP_CAPITAL_PCT)))
+        self.LP_MAX_MARKETS = int(os.getenv("LP_MAX_MARKETS", str(self.LP_MAX_MARKETS)))
+        self.LP_REFRESH_INTERVAL = int(os.getenv("LP_REFRESH_INTERVAL", str(self.LP_REFRESH_INTERVAL)))
+
+        # ── Base Rate Rules ──────────────────────────────────────────────
+        self.BASE_RATE_MIN = float(os.getenv("BASE_RATE_MIN", str(self.BASE_RATE_MIN)))
+        self.BASE_RATE_SIZE_CUT = float(os.getenv("BASE_RATE_SIZE_CUT", str(self.BASE_RATE_SIZE_CUT)))
+        hold_env = os.getenv("HOLD_TO_RESOLUTION", "true").strip().lower()
+        self.HOLD_TO_RESOLUTION = hold_env in ("1", "true", "yes")
+
+        # ── Drawdown / consecutive-loss circuit breaker ──────────────────
+        self.MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", str(self.MAX_DAILY_DRAWDOWN_PCT)))
+        self.MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", str(self.MAX_CONSECUTIVE_LOSSES)))
+
+        # ── Whale / large trade detection ─────────────────────────────
+        self.WHALE_MIN_TRADE_USD = float(os.getenv("WHALE_MIN_TRADE_USD", str(self.WHALE_MIN_TRADE_USD)))
+        self.WHALE_LOOKBACK_MINUTES = int(os.getenv("WHALE_LOOKBACK_MINUTES", str(self.WHALE_LOOKBACK_MINUTES)))
+
+        # ── Bayesian Re-evaluation ───────────────────────────────────────
+        self.REEVALUATE_INTERVAL = int(os.getenv("REEVALUATE_INTERVAL", str(self.REEVALUATE_INTERVAL)))
 
         # ── Trading mode ─────────────────────────────────────────────────
         # New TRADING_MODE env var takes precedence.

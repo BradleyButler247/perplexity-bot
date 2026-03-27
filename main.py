@@ -43,12 +43,18 @@ from trade_history import TradeHistory
 from wallet_discovery import WalletDiscovery
 from strategy_optimizer import StrategyOptimizer
 from redeemer import Redeemer
+from http_client import close_session
 from strategies import (
     ArbitrageStrategy,
     CopyTradingStrategy,
     SignalBasedStrategy,
     CryptoMeanReversionStrategy,
     ContrarianExtremeStrategy,
+    AIPoweredStrategy,
+    SportsMomentumStrategy,
+    CrossMarketArbStrategy,
+    WeatherForecastArbStrategy,
+    LPRewardsStrategy,
     BaseStrategy,
     TradeSignal,
 )
@@ -58,7 +64,7 @@ logger = logging.getLogger("bot.main")
 # ── Banner ─────────────────────────────────────────────────────────────────────
 BANNER = """
 ╔══════════════════════════════════════════════════════╗
-║     Polymarket Multi-Strategy Trading Bot v1.2       ║
+║     Polymarket Multi-Strategy Trading Bot v1.3       ║
 ║     Polygon Network (USDC)                           ║
 ╚══════════════════════════════════════════════════════╝
 """
@@ -121,7 +127,7 @@ Examples:
     parser.add_argument(
         "--strategies",
         nargs="+",
-        choices=["arbitrage", "copy_trading", "signal_based", "crypto_mean_reversion", "contrarian_extreme"],
+        choices=["arbitrage", "copy_trading", "signal_based", "crypto_mean_reversion", "contrarian_extreme", "ai_powered", "sports_momentum", "cross_market_arb", "weather_forecast_arb", "lp_rewards"],
         default=None,
         help="Specify which strategies to run (default: all)",
     )
@@ -197,6 +203,7 @@ class TradingBot:
         self.optimizer: Optional[StrategyOptimizer] = None
         self.redeemer: Optional[Redeemer] = None
         self.ws_manager: Optional[WebSocketManager] = None
+        self.ai_engine = None  # AIProbabilityEngine — shared by AI strategy + trade manager
         self.strategies: List[BaseStrategy] = []
         self._shutdown = False
         self._ws_thread: Optional[threading.Thread] = None
@@ -269,12 +276,17 @@ class TradingBot:
         # ── Risk manager ────────────────────────────────────────────────────
         self.risk_manager = RiskManager(self.cfg, self.tracker)
 
+        # ── AI Probability Engine (shared) ───────────────────────────────
+        from ai_probability_engine import AIProbabilityEngine
+        self.ai_engine = AIProbabilityEngine(self.cfg)
+
         # ── Trade manager ──────────────────────────────────────────────────
         self.trade_manager = TradeManager(
             tracker=self.tracker,
             executor=self.executor,
             cfg=self.cfg,
             market_scanner=self.scanner,
+            ai_engine=self.ai_engine,
         )
         logger.info(
             "TradeManager ready | tp=%.0f%% sl=%.0f%% trail_act=%.0f%% trail_stop=%.0f%% max_hold=%dh",
@@ -338,7 +350,7 @@ class TradingBot:
 
     def _init_strategies(self) -> None:
         """Instantiate enabled strategies."""
-        enabled = self.args.strategies or ["arbitrage", "copy_trading", "signal_based", "crypto_mean_reversion", "contrarian_extreme"]
+        enabled = self.args.strategies or ["arbitrage", "copy_trading", "signal_based", "crypto_mean_reversion", "contrarian_extreme", "ai_powered", "sports_momentum", "cross_market_arb", "weather_forecast_arb", "lp_rewards"]
 
         client = get_client()
         common_kwargs = dict(
@@ -368,6 +380,16 @@ class TradingBot:
                     **common_kwargs,
                     position_tracker=self.tracker,
                 )
+            elif name == "ai_powered":
+                strategy = AIPoweredStrategy(**common_kwargs, ai_engine=self.ai_engine)
+            elif name == "sports_momentum":
+                strategy = SportsMomentumStrategy(**common_kwargs)
+            elif name == "cross_market_arb":
+                strategy = CrossMarketArbStrategy(**common_kwargs)
+            elif name == "weather_forecast_arb":
+                strategy = WeatherForecastArbStrategy(**common_kwargs)
+            elif name == "lp_rewards":
+                strategy = LPRewardsStrategy(**common_kwargs)
             else:
                 logger.warning("Unknown strategy '%s'; skipping.", name)
                 continue
@@ -612,6 +634,10 @@ class TradingBot:
                     approved = self.risk_manager.approve_trade(signal)
 
                 if approved:
+                    # v34: Apply base-rate sizing before execution
+                    if signal.side == "BUY" and self.trade_manager:
+                        signal = self.trade_manager.apply_base_rate_sizing(signal)
+
                     # Cap trades per cycle to prevent runaway ordering
                     max_per_cycle = 3 if self.cfg.TRADING_MODE == "micro" else 5
                     if executed >= max_per_cycle:
@@ -1021,6 +1047,9 @@ class TradingBot:
                 )
             except Exception:
                 pass  # ws thread may already be down
+
+        # Close shared HTTP session
+        close_session()
 
         logger.info("Bot shutdown complete.")
 

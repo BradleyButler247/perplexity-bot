@@ -29,6 +29,9 @@ from typing import Dict, List, Optional, Set, TYPE_CHECKING
 
 import requests
 
+from constants import DATA_API, parse_timestamp
+from http_client import get_session
+from market_scanner import classify_market
 from strategies.base import BaseStrategy, TradeSignal
 
 if TYPE_CHECKING:
@@ -36,7 +39,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DATA_API = "https://data-api.polymarket.com"
 
 # Maximum price movement (absolute) allowed since target's trade price
 MAX_PRICE_DRIFT = 0.05   # 5 cents
@@ -66,8 +68,7 @@ class CopyTradingStrategy(BaseStrategy):
     def __init__(self, *args, wallet_discovery: Optional["WalletDiscovery"] = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._seen_trade_ids: Set[str] = set()
-        self._session = requests.Session()
-        self._session.headers.update({"Accept": "application/json"})
+        self._session = get_session()
         self._wallet_discovery: Optional["WalletDiscovery"] = wallet_discovery
 
         # Per-wallet seen-trade tracking to support multi-wallet monitoring
@@ -254,7 +255,7 @@ class CopyTradingStrategy(BaseStrategy):
             return None
 
         # Age check: skip if the trade is stale
-        trade_ts = _parse_timestamp(trade)
+        trade_ts = parse_timestamp(trade)
         if trade_ts and (time.time() - trade_ts) > self.cfg.COPY_TRADE_MAX_AGE:
             self.log.debug(
                 "Trade %s from wallet %s too old (%.0fs ago); skipping.",
@@ -328,6 +329,19 @@ class CopyTradingStrategy(BaseStrategy):
             )
             return None
 
+        # ── Category-locking (v34) ───────────────────────────────────────
+        # If wallet has category data, check that this market matches
+        if self._wallet_discovery is not None:
+            market_category = self._get_market_category(market_id, market)
+            wallet_categories = self._wallet_discovery.get_wallet_categories(wallet)
+            if wallet_categories and market_category:
+                if market_category not in wallet_categories:
+                    self.log.debug(
+                        "Category-lock: wallet %s strong in %s, market is %s; skipping.",
+                        wallet[:10], wallet_categories[:3], market_category,
+                    )
+                    return None
+
         # Calculate size: COPY_TRADE_SIZE / current_ask gives number of shares
         if current_ask <= 0:
             return None
@@ -365,21 +379,25 @@ class CopyTradingStrategy(BaseStrategy):
         )
 
 
-def _parse_timestamp(trade: dict) -> Optional[float]:
-    """
-    Extract a Unix timestamp (seconds) from a trade dict.
+    def _get_market_category(self, market_id: str, market=None) -> Optional[str]:
+        """
+        Classify a market into a category using the shared classify_market utility.
 
-    Handles multiple common field names and both seconds and milliseconds.
-    """
-    for key in ("timestamp", "createdAt", "created_at", "time", "ts"):
-        val = trade.get(key)
-        if val:
-            try:
-                ts = float(val)
-                # If the value is in milliseconds (> year 2100 in seconds), convert
-                if ts > 4_102_444_800:
-                    ts /= 1000.0
-                return ts
-            except (TypeError, ValueError):
-                continue
-    return None
+        Args:
+            market_id: The market condition ID.
+            market: Optional MarketInfo if already fetched.
+
+        Returns:
+            Category string or None if classification fails.
+        """
+        if market and hasattr(market, "question"):
+            return classify_market(market.question)
+
+        # Try to get the market from scanner
+        if self.market_scanner:
+            m = self.market_scanner.get_market(market_id)
+            if m:
+                return classify_market(m.question)
+
+        return None
+

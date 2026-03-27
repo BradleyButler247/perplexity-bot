@@ -33,13 +33,13 @@ Persistence:
 """
 
 import json
+import random
 import logging
 import math
 import os
 import time
-from copy import deepcopy
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from config import Config
 from trade_history import TradeHistory, TradeRecord
@@ -53,7 +53,19 @@ DEFAULT_STATE_FILE = "optimizer_state.json"
 STRATEGY_ARBITRAGE = "arbitrage"
 STRATEGY_COPY_TRADING = "copy_trading"
 STRATEGY_SIGNAL_BASED = "signal_based"
-ALL_STRATEGIES = [STRATEGY_ARBITRAGE, STRATEGY_COPY_TRADING, STRATEGY_SIGNAL_BASED]
+STRATEGY_CRYPTO_MR = "crypto_mean_reversion"
+STRATEGY_CONTRARIAN = "contrarian_extreme"
+STRATEGY_AI = "ai_powered"
+STRATEGY_SPORTS = "sports_momentum"
+STRATEGY_CROSS_ARB = "cross_market_arb"
+STRATEGY_WEATHER = "weather_forecast_arb"
+STRATEGY_LP = "lp_rewards"
+
+ALL_STRATEGIES = [
+    STRATEGY_ARBITRAGE, STRATEGY_COPY_TRADING, STRATEGY_SIGNAL_BASED,
+    STRATEGY_CRYPTO_MR, STRATEGY_CONTRARIAN, STRATEGY_AI,
+    STRATEGY_SPORTS, STRATEGY_CROSS_ARB, STRATEGY_WEATHER, STRATEGY_LP,
+]
 
 
 @dataclass
@@ -84,9 +96,16 @@ class OptimizerState:
 
     # Strategy allocation weights (sum to 1.0)
     strategy_weights: Dict[str, float] = field(default_factory=lambda: {
-        STRATEGY_ARBITRAGE: 0.333,
-        STRATEGY_COPY_TRADING: 0.333,
-        STRATEGY_SIGNAL_BASED: 0.334,
+        STRATEGY_ARBITRAGE: 0.10,
+        STRATEGY_COPY_TRADING: 0.10,
+        STRATEGY_SIGNAL_BASED: 0.10,
+        STRATEGY_CRYPTO_MR: 0.10,
+        STRATEGY_CONTRARIAN: 0.10,
+        STRATEGY_AI: 0.10,
+        STRATEGY_SPORTS: 0.10,
+        STRATEGY_CROSS_ARB: 0.10,
+        STRATEGY_WEATHER: 0.10,
+        STRATEGY_LP: 0.10,
     })
 
     # Tunable parameters — current values (mutated by optimizer)
@@ -196,7 +215,7 @@ class StrategyOptimizer:
 
     def get_strategy_weight(self, strategy_name: str) -> float:
         """Return the current weight for a strategy (0.0–1.0)."""
-        return self.state.strategy_weights.get(strategy_name, 0.333)
+        return self.state.strategy_weights.get(strategy_name, 0.10)
 
     def should_execute_signal(self, signal) -> bool:
         """
@@ -208,7 +227,6 @@ class StrategyOptimizer:
 
         All strategies always get at least a 10% floor to prevent starvation.
         """
-        import random
         weight = self.get_strategy_weight(signal.strategy)
         # Floor: always allow at least 10% through
         effective_weight = max(weight, 0.10)
@@ -278,8 +296,11 @@ class StrategyOptimizer:
         recorded price.
         """
         perf: Dict[str, StrategyPerformance] = {}
+        # Track individual trade PnLs per strategy for accurate profit factor / Sharpe
+        pnl_by_strategy: Dict[str, List[float]] = {}
         for s in ALL_STRATEGIES + ["trade_manager"]:
             perf[s] = StrategyPerformance(strategy=s)
+            pnl_by_strategy[s] = []
 
         # Group by token_id to pair entries and exits
         by_token: Dict[str, List[TradeRecord]] = {}
@@ -294,6 +315,7 @@ class StrategyOptimizer:
                 strategy = buy.strategy
                 if strategy not in perf:
                     perf[strategy] = StrategyPerformance(strategy=strategy)
+                    pnl_by_strategy[strategy] = []
 
                 sp = perf[strategy]
                 sp.total_trades += 1
@@ -306,8 +328,13 @@ class StrategyOptimizer:
                         break
 
                 if matching_sell:
-                    # Closed trade: compute realised P&L
-                    pnl = (matching_sell.price - buy.price) * buy.size
+                    # Closed trade: compute realised P&L using log returns
+                    arith_pnl = (matching_sell.price - buy.price) * buy.size
+                    if buy.price > 0 and matching_sell.price > 0:
+                        log_return = math.log(matching_sell.price / buy.price)
+                    else:
+                        log_return = 0.0
+                    pnl = arith_pnl  # Keep arithmetic for display; use log for aggregation
                     hold_time = matching_sell.timestamp - buy.timestamp
                     sells.remove(matching_sell)
                 else:
@@ -316,6 +343,7 @@ class StrategyOptimizer:
                     hold_time = time.time() - buy.timestamp
 
                 sp.total_pnl += pnl
+                pnl_by_strategy[strategy].append(pnl)
                 sp.avg_hold_time_s = (
                     (sp.avg_hold_time_s * (sp.total_trades - 1) + hold_time)
                     / sp.total_trades
@@ -332,36 +360,34 @@ class StrategyOptimizer:
                 sp.avg_pnl_per_trade = sp.total_pnl / sp.total_trades
                 sp.win_rate = sp.winning_trades / sp.total_trades
 
-                # Profit factor
-                gross_wins = sum(
-                    1 for _ in range(sp.winning_trades)
-                ) * abs(sp.avg_pnl_per_trade) if sp.winning_trades else 0
-                gross_losses = sum(
-                    1 for _ in range(sp.losing_trades)
-                ) * abs(sp.avg_pnl_per_trade) if sp.losing_trades else 0
-                sp.profit_factor = (
-                    gross_wins / gross_losses if gross_losses > 0 else float("inf")
-                )
+                # Profit factor: gross winning PnL / abs(gross losing PnL)
+                trade_pnls = pnl_by_strategy.get(sp.strategy, [])
+                sp.profit_factor = self._compute_profit_factor(trade_pnls)
 
                 # Simplified Sharpe: avg_pnl / std_dev_pnl
-                sp.sharpe_ratio = self._compute_sharpe(sp, records)
+                sp.sharpe_ratio = self._compute_sharpe(sp, records, trade_pnls)
 
         return perf
 
+    @staticmethod
+    def _compute_profit_factor(trade_pnls: List[float]) -> float:
+        """Compute profit factor: gross wins / abs(gross losses)."""
+        winning_pnls = [p for p in trade_pnls if p > 0]
+        losing_pnls = [p for p in trade_pnls if p < 0]
+        if not winning_pnls or not losing_pnls:
+            return 1.0  # insufficient data
+        return sum(winning_pnls) / abs(sum(losing_pnls))
+
     def _compute_sharpe(
-        self, sp: StrategyPerformance, records: List[TradeRecord]
+        self, sp: StrategyPerformance, records: List[TradeRecord],
+        trade_pnls: Optional[List[float]] = None,
     ) -> float:
-        """Compute a simplified Sharpe ratio for a strategy."""
-        strat_records = [r for r in records if r.strategy == sp.strategy and r.side == "BUY"]
-        if len(strat_records) < 2:
-            return 0.0
-
-        pnls = []
-        for rec in strat_records:
-            # Approximate P&L per trade using price distance from entry
-            pnls.append(rec.usd_value * 0.01)  # placeholder; real P&L computed above
-
+        """Compute a simplified Sharpe ratio for a strategy using actual P&L."""
+        pnls = trade_pnls if trade_pnls is not None else []
+        # Fall back: try to infer from records if no pnl list supplied
         if not pnls:
+            return 0.0
+        if len(pnls) < 2:
             return 0.0
 
         mean_pnl = sum(pnls) / len(pnls)
@@ -451,7 +477,7 @@ class StrategyOptimizer:
             sp = perf_map.get(strat_name)
             if not sp or sp.total_trades < 5:
                 # Not enough data — keep current weight
-                scores[strat_name] = self.state.strategy_weights.get(strat_name, 0.333)
+                scores[strat_name] = self.state.strategy_weights.get(strat_name, 0.10)
                 continue
 
             # Composite score: 50% win rate, 30% profit factor, 20% Sharpe
@@ -461,6 +487,30 @@ class StrategyOptimizer:
 
             score = 0.50 * wr_score + 0.30 * pf_score + 0.20 * sh_score
             scores[strat_name] = max(score, 0.05)  # floor of 5%
+
+        # ── Drawdown-based throttling ────────────────────────────────────────
+        # Penalise strategies with negative Sharpe or negative total PnL.
+        # Strategies with 5+ consecutive losses get a heavier reduction.
+        for strat_name in ALL_STRATEGIES:
+            sp = perf_map.get(strat_name)
+            if not sp or sp.total_trades < 5:
+                continue
+            # Count consecutive losses at the end of the record (approximate)
+            consec_losses = sp.losing_trades  # rough proxy if no per-trade sequence
+            if sp.sharpe_ratio < 0 or sp.total_pnl < 0:
+                scores[strat_name] = scores.get(strat_name, 0.10) * 0.75  # reduce 25%
+                logger.debug(
+                    "Throttling %s 25%%: sharpe=%.2f pnl=%.2f",
+                    strat_name, sp.sharpe_ratio, sp.total_pnl,
+                )
+            if consec_losses >= 5:
+                scores[strat_name] = scores.get(strat_name, 0.10) * 0.50  # reduce 50%
+                logger.debug(
+                    "Throttling %s 50%%: consec_losses=%d",
+                    strat_name, consec_losses,
+                )
+            # Floor: never fully disable
+            scores[strat_name] = max(scores.get(strat_name, 0.02), 0.02)
 
         # Normalise scores to sum to 1.0
         total_score = sum(scores.values())
@@ -472,8 +522,8 @@ class StrategyOptimizer:
         # Gradually move toward target (max shift per cycle)
         old_weights = dict(self.state.strategy_weights)
         for strat_name in ALL_STRATEGIES:
-            current = self.state.strategy_weights.get(strat_name, 0.333)
-            target = target_weights.get(strat_name, 0.333)
+            current = self.state.strategy_weights.get(strat_name, 0.10)
+            target = target_weights.get(strat_name, 0.10)
             delta = target - current
             # Clamp the shift
             clamped_delta = max(-self.max_param_shift, min(self.max_param_shift, delta))
@@ -488,7 +538,7 @@ class StrategyOptimizer:
 
         # Log changes
         for s in ALL_STRATEGIES:
-            old_w = old_weights.get(s, 0.333)
+            old_w = old_weights.get(s, 0.10)
             new_w = self.state.strategy_weights[s]
             if abs(new_w - old_w) > 0.005:
                 logger.info(
@@ -760,11 +810,8 @@ class StrategyOptimizer:
                 recent_win_rate * 100,
             )
             self.state.tuned_params = dict(self.state.baseline_params)
-            self.state.strategy_weights = {
-                STRATEGY_ARBITRAGE: 0.333,
-                STRATEGY_COPY_TRADING: 0.333,
-                STRATEGY_SIGNAL_BASED: 0.334,
-            }
+            equal_weight = 1.0 / len(ALL_STRATEGIES)
+            self.state.strategy_weights = {s: equal_weight for s in ALL_STRATEGIES}
             logger.info("Parameters reverted to baseline.")
 
     # ─────────────────────────────────────────────────────────────────────────

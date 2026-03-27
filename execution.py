@@ -259,7 +259,7 @@ class Executor:
             q = 1 - p
             b = net payout ratio (1/price - 1 for binary markets)
 
-        We use half-Kelly (f*/2) to be conservative, then cap at
+        We use quarter-Kelly (f*/4) to be conservative, then cap at
         MICRO_TRADE_SIZE to limit absolute risk.
         """
         import dataclasses
@@ -277,14 +277,14 @@ class Executor:
         else:
             kelly_fraction = (p * b - q) / b
 
-        # Half-Kelly for conservative sizing
-        half_kelly = max(kelly_fraction / 2.0, 0.0)
+        # Quarter-Kelly for conservative sizing
+        quarter_kelly = max(kelly_fraction / 4.0, 0.0)
 
         # Apply Kelly to determine USD to risk
         balance = self._get_usdc_balance()
         bankroll = balance if balance > 0 else self.cfg.MICRO_TRADE_SIZE * 10
 
-        kelly_usd = bankroll * half_kelly
+        kelly_usd = bankroll * quarter_kelly
         # Cap at MICRO_TRADE_SIZE and floor at minimum viable trade
         trade_usd = max(min(kelly_usd, self.cfg.MICRO_TRADE_SIZE), self.cfg.MICRO_TRADE_SIZE * 0.5)
 
@@ -314,9 +314,9 @@ class Executor:
         overridden = dataclasses.replace(signal, size=micro_size)
         actual_cost = micro_size * signal.price
         logger.debug(
-            "[MICRO] Kelly sizing: conf=%.2f kelly=%.3f half=%.3f -> "
+            "[MICRO] Kelly sizing: conf=%.2f kelly=%.3f quarter=%.3f -> "
             "$%.2f (%.1f shares @ $%.3f)",
-            p, kelly_fraction, half_kelly,
+            p, kelly_fraction, quarter_kelly,
             actual_cost, micro_size, signal.price,
         )
         return overridden

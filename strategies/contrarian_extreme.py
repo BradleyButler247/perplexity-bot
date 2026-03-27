@@ -24,6 +24,7 @@ This is a HIGH RISK strategy — 80% of individual trades lose. It is only
 profitable in aggregate across many trades due to the asymmetric payoff.
 """
 
+import datetime
 import logging
 import re
 import time
@@ -273,7 +274,6 @@ class ContrarianExtremeStrategy(BaseStrategy):
         if not market.end_date:
             return None
         try:
-            import datetime
             end_str = market.end_date
             if "T" in end_str:
                 end_dt = datetime.datetime.fromisoformat(

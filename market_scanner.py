@@ -14,7 +14,9 @@ Rate limits (public endpoints): ~100 requests/minute.
 """
 
 import datetime
+import json
 import logging
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -24,8 +26,90 @@ import requests
 from py_clob_client.client import ClobClient
 
 from config import Config
+from http_client import get_session
 
 logger = logging.getLogger(__name__)
+
+# ── Shared market classification ──────────────────────────────────────────────
+# Single source of truth for categorising markets by question text.
+# Strategies should call classify_market() instead of duplicating regex lists.
+
+_CLASSIFICATION_PATTERNS: Dict[str, List[re.Pattern]] = {
+    "crypto": [
+        re.compile(r"\b(bitcoin|btc|ethereum|eth|solana|sol|crypto|blockchain)\b", re.I),
+        re.compile(r"\b(defi|nft|token|halving|etf|binance|coinbase)\b", re.I),
+        re.compile(r"\b(up or down|price target|all.time.high|ath)\b", re.I),
+    ],
+    "sports": [
+        re.compile(r"\b(nba|nfl|mlb|nhl|mls|premier league|champions league|serie a|la liga)\b", re.I),
+        re.compile(r"\b(basketball|football|soccer|baseball|hockey|tennis|golf|boxing|mma|ufc|f1|formula)\b", re.I),
+        re.compile(r"\b(championship|playoffs|finals|match|tournament|super bowl|world cup)\b", re.I),
+    ],
+    "esports": [
+        re.compile(r"\b(league of legends|lol|cs2|csgo|dota|valorant|overwatch)\b", re.I),
+        re.compile(r"\b(esports?|e-sports?|gaming|twitch|worlds|major|lan)\b", re.I),
+    ],
+    "politics": [
+        re.compile(r"\b(president|congress|senate|house|election|vote|poll|bill|legislation)\b", re.I),
+        re.compile(r"\b(democrat|republican|gop|liberal|conservative)\b", re.I),
+        re.compile(r"\b(governor|mayor|supreme court|executive order|impeach)\b", re.I),
+        re.compile(r"\b(trump|biden|desantis|harris|newsom)\b", re.I),
+    ],
+    "geopolitics": [
+        re.compile(r"\b(war|conflict|sanctions|treaty|nato|united nations|g7|g20)\b", re.I),
+        re.compile(r"\b(russia|ukraine|china|taiwan|iran|israel|gaza|north korea)\b", re.I),
+        re.compile(r"\b(diplomacy|ceasefire|invasion|military|tariff|trade war)\b", re.I),
+    ],
+    "finance": [
+        re.compile(r"\b(fed|federal reserve|interest rate|inflation|gdp|recession)\b", re.I),
+        re.compile(r"\b(stock|s&p|nasdaq|dow|earnings|ipo|market cap)\b", re.I),
+        re.compile(r"\b(treasury|bond|yield|forex|dollar)\b", re.I),
+    ],
+    "weather": [
+        re.compile(r"\b(weather|temperature|rain|snow|hurricane|tornado|storm|flood)\b", re.I),
+        re.compile(r"\b(heat|cold|freeze|drought|wildfire|celsius|fahrenheit)\b", re.I),
+        re.compile(r"\b(noaa|nws|forecast|wind|hail|blizzard)\b", re.I),
+        re.compile(r"\b(record high|record low|above normal|below normal)\b", re.I),
+    ],
+    "entertainment": [
+        re.compile(r"\b(oscar|grammy|emmy|tony|golden globe|award|nomination)\b", re.I),
+        re.compile(r"\b(movie|film|album|song|tv show|netflix|disney|spotify)\b", re.I),
+        re.compile(r"\b(celebrity|kardashian|musk|taylor swift|drake)\b", re.I),
+    ],
+    "economics": [
+        re.compile(r"\b(unemployment|jobs report|cpi|ppi|housing|retail sales)\b", re.I),
+        re.compile(r"\b(trade deficit|manufacturing|services|pmi)\b", re.I),
+    ],
+}
+
+# Cache for classification results
+_classification_cache: Dict[str, str] = {}
+
+
+def classify_market(question: str) -> str:
+    """
+    Classify a market question into a category string.
+
+    Returns one of: crypto, sports, esports, politics, geopolitics,
+    finance, weather, entertainment, economics, or "other".
+
+    Results are cached by question text.
+    """
+    if question in _classification_cache:
+        return _classification_cache[question]
+
+    best_category = "other"
+    best_score = 0
+
+    q_lower = question.lower()
+    for category, patterns in _CLASSIFICATION_PATTERNS.items():
+        score = sum(1 for pat in patterns if pat.search(q_lower))
+        if score > best_score:
+            best_score = score
+            best_category = category
+
+    _classification_cache[question] = best_category
+    return best_category
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 GAMMA_MARKETS_URL = f"{GAMMA_API}/markets"
@@ -90,8 +174,7 @@ class MarketScanner:
         self.client = client
         self._cache: Dict[str, MarketInfo] = {}  # market_id -> MarketInfo
         self._last_full_scan: float = 0.0
-        self._session = requests.Session()
-        self._session.headers.update({"Accept": "application/json"})
+        self._session = get_session()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -299,7 +382,6 @@ class MarketScanner:
         # Token IDs: Gamma returns them as a JSON-encoded string list or plain list
         token_ids_raw = raw.get("clobTokenIds") or raw.get("tokens") or []
         if isinstance(token_ids_raw, str):
-            import json
             try:
                 token_ids_raw = json.loads(token_ids_raw)
             except Exception:
@@ -307,7 +389,6 @@ class MarketScanner:
 
         outcomes = raw.get("outcomes") or ["Yes", "No"]
         if isinstance(outcomes, str):
-            import json
             try:
                 outcomes = json.loads(outcomes)
             except Exception:

@@ -25,8 +25,10 @@ import os
 import time
 from typing import Dict, List, Optional
 
-import requests
 from web3 import Web3
+
+from constants import DATA_API
+from http_client import get_session
 try:
     # web3 v7+
     from web3.middleware import ExtraDataToPOAMiddleware as poa_middleware
@@ -67,7 +69,6 @@ REDEEM_ABI = [
     }
 ]
 
-DATA_API = "https://data-api.polymarket.com"
 
 # Cooldown between redemption attempts for the same condition (seconds)
 REDEEM_COOLDOWN = 600  # 10 minutes
@@ -84,8 +85,7 @@ class Redeemer:
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self._session = requests.Session()
-        self._session.headers.update({"Accept": "application/json"})
+        self._session = get_session()
 
         # Track redeemed conditions to avoid repeated attempts
         self._redeemed: Dict[str, float] = {}  # condition_id -> timestamp
