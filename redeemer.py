@@ -175,6 +175,8 @@ class Redeemer:
             title = position.get("title", "Unknown market")
             size = float(position.get("size", 0) or 0)
             outcome = position.get("outcome", "")
+            is_loss = position.get("_is_loss", False)
+            label = "LOSS" if is_loss else "WIN"
 
             try:
                 success = self._redeem_position(condition_id)
@@ -183,11 +185,12 @@ class Redeemer:
                 if success:
                     redeemed_count += 1
                     logger.info(
-                        "Redeemed: %s | %s | %.1f shares | %s",
-                        condition_id[:16], outcome, size, title[:50],
+                        "Redeemed [%s]: %s | %s | %.1f shares | %s",
+                        label, condition_id[:16], outcome, size, title[:50],
                     )
+                    icon = "\U0001f4b0" if not is_loss else "\U0001f9f9"
                     print(
-                        f"  [\u2026] \ud83d\udcb0 Redeemed {outcome} {size:.1f} shares | {title[:50]}",
+                        f"  [\u2026] {icon} Redeemed [{label}] {outcome} {size:.1f} shares | {title[:50]}",
                         flush=True,
                     )
             except Exception as exc:
@@ -206,10 +209,17 @@ class Redeemer:
         """
         Fetch positions that can be redeemed from the Data API.
 
-        Looks for positions where:
-          - redeemable=true (market has resolved)
-          - size > 0 (still holding tokens)
+        Includes BOTH winners and losers:
+          - Winners: redeemable=true, returns USDC
+          - Losers: resolved market, tokens worth $0 but need to be cleared
+            from the account to free up the position slot and keep things clean
+
+        Polymarket's redeemPositions() handles both — winning tokens return
+        collateral, losing tokens are burned for $0. Both must be redeemed.
         """
+        all_redeemable: Dict[str, dict] = {}  # condition_id -> position
+
+        # ── Pass 1: Explicitly redeemable positions (usually winners) ────
         try:
             url = f"{DATA_API}/positions"
             params = {
@@ -222,21 +232,62 @@ class Redeemer:
             resp.raise_for_status()
             positions = resp.json() or []
 
-            redeemable = [
-                p for p in positions
-                if p.get("redeemable") is True
-                and float(p.get("size", 0) or 0) > 0
-            ]
+            for p in positions:
+                cid = p.get("conditionId", "")
+                if cid and float(p.get("size", 0) or 0) > 0:
+                    all_redeemable[cid] = p
 
-            if redeemable:
-                logger.info(
-                    "Found %d redeemable position(s).", len(redeemable),
-                )
-
-            return redeemable
         except Exception as exc:
             logger.debug("Failed to fetch redeemable positions: %s", exc)
-            return []
+
+        # ── Pass 2: Resolved positions that may be losses ────────────────
+        # Query for all positions, then filter to resolved markets with
+        # tokens still held (these are unredeemed losers)
+        try:
+            url = f"{DATA_API}/positions"
+            params = {
+                "user": wallet,
+                "sizeThreshold": 0.01,
+                "limit": 200,
+            }
+            resp = self._session.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            positions = resp.json() or []
+
+            for p in positions:
+                cid = p.get("conditionId", "")
+                if not cid or cid in all_redeemable:
+                    continue
+
+                size = float(p.get("size", 0) or 0)
+                if size <= 0:
+                    continue
+
+                # Check if the market has resolved
+                # resolved=True or curPrice is exactly 0 or 1 (binary outcome)
+                is_resolved = p.get("resolved") is True
+                cur_price = float(p.get("curPrice", -1) or -1)
+                if not is_resolved and cur_price not in (0.0, 1.0):
+                    continue
+
+                # This is a resolved position still held — likely a loss
+                # Mark it for redemption
+                p["_is_loss"] = True
+                all_redeemable[cid] = p
+
+        except Exception as exc:
+            logger.debug("Failed to fetch resolved positions: %s", exc)
+
+        result = list(all_redeemable.values())
+        if result:
+            winners = sum(1 for p in result if not p.get("_is_loss"))
+            losers = sum(1 for p in result if p.get("_is_loss"))
+            logger.info(
+                "Found %d redeemable position(s) (%d winners, %d losses to clear).",
+                len(result), winners, losers,
+            )
+
+        return result
 
     def _redeem_position(self, condition_id: str) -> bool:
         """
