@@ -323,7 +323,7 @@ class ContrarianExtremeStrategy(BaseStrategy):
             return False  # Less than a day of data — allow
 
         # If every observation shows extreme price, it's been there too long
-        all_extreme = all(p >= EXTREME_THRESHOLD * 0.95 for _, p in history)
+        all_extreme = all(p >= EXTREME_THRESHOLD * 0.90 for _, p in history)
 
         if all_extreme and days_tracked >= MAX_DAYS_AT_EXTREME:
             return True

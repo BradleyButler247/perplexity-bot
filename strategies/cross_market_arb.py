@@ -412,7 +412,10 @@ class CrossMarketArbStrategy(BaseStrategy):
 
             self._event_cache = multi_market
             self._event_cache_ts = now
-            self.log.debug("Fetched %d multi-market events.", len(multi_market))
+            self.log.info(
+                "Cross-market arb: fetched %d multi-market event group(s) from Gamma API.",
+                len(multi_market),
+            )
             return multi_market
 
         except Exception as exc:

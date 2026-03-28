@@ -58,6 +58,15 @@ CRYPTO_MARKET_PATTERNS = [
     r"btc\s+up\s+or\s+down",
     r"ethereum\s+up\s+or\s+down",
     r"eth\s+up\s+or\s+down",
+    r"bitcoin.*price",
+    r"btc.*price",
+    r"ethereum.*price",
+    r"eth.*price",
+    r"bitcoin.*above",
+    r"bitcoin.*below",
+    r"btc.*above",
+    r"btc.*below",
+    r"crypto.*up.*down",
 ]
 
 # Series identifiers for crypto Up/Down markets
@@ -186,6 +195,15 @@ class CryptoMeanReversionStrategy(BaseStrategy):
             # Additional check: must mention crypto
             if any(kw in q for kw in ["bitcoin", "btc", "ethereum", "eth", "crypto"]):
                 return True
+
+        # Check for Yes/No crypto markets (e.g., "Will BTC be above 90K?")
+        if any(kw in q for kw in ["bitcoin", "btc", "ethereum", "eth", "crypto"]):
+            yes_no_outcomes = {o.lower() for o in outcomes}
+            if yes_no_outcomes & {"yes", "no"}:
+                # Get the best ask price of any token
+                token_prices = [t.best_ask for t in market.tokens if t.best_ask > 0]
+                if token_prices and min(token_prices) < 0.70:
+                    return True
 
         return False
 

@@ -57,7 +57,7 @@ EXIT_THRESHOLD = 0.55       # Sell at 55¢+ for solid profit on <40¢ entries
 MIN_EDGE = 0.12             # 12 percentage points minimum edge
 
 # Minimum forecast confidence to act on
-MIN_FORECAST_CONFIDENCE = 0.60  # Only trade when forecast says ≥60% likely
+MIN_FORECAST_CONFIDENCE = 0.50  # Only trade when forecast says ≥50% likely
 
 # Maximum signals per scan cycle
 MAX_SIGNALS_PER_CYCLE = 3
@@ -179,6 +179,7 @@ class WeatherForecastArbStrategy(BaseStrategy):
             "rain", "snow", "precipitation", "weather", "high temp",
             "low temp", "heat", "cold", "freeze", "frost", "hurricane",
             "tornado", "storm", "wind", "drought", "flood",
+            "high temperature", "hot", "warm", "cool",
         ]
         if not any(kw in q for kw in weather_keywords):
             return False

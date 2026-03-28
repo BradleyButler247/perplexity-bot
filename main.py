@@ -43,6 +43,7 @@ from trade_history import TradeHistory
 from wallet_discovery import WalletDiscovery
 from strategy_optimizer import StrategyOptimizer
 from redeemer import Redeemer
+from pnl_tracker import PnLTracker
 from http_client import close_session
 from strategies import (
     ArbitrageStrategy,
@@ -334,6 +335,10 @@ class TradingBot:
         # Apply any previously-tuned parameters from optimizer state
         self._apply_tuned_params()
 
+
+        # ── P&L tracker ──────────────────────────────────────────────────
+        self.pnl_tracker = PnLTracker(self.tracker, self.trade_history)
+        logger.info("P&L tracker ready. Reports saved to reports/ directory.")
         # ── Strategies ─────────────────────────────────────────────────────
         self._init_strategies()
 
@@ -750,6 +755,10 @@ class TradingBot:
         # ── 9. Show open orders ──────────────────────────────────────────────
         self._print_open_orders()
 
+
+        # Update P&L tracker
+        if hasattr(self, "pnl_tracker"):
+            self.pnl_tracker.update()
         # Print cycle summary line
         cycle_elapsed = time.time() - cycle_start
         pnl_str = f"${self.risk_manager.daily_pnl:+.2f}"
@@ -1023,6 +1032,14 @@ class TradingBot:
             except Exception as exc:
                 logger.warning("Error printing trade history report: %s", exc)
 
+
+        # Write final P&L report
+        if hasattr(self, "pnl_tracker"):
+            try:
+                report_path = self.pnl_tracker.write_report()
+                logger.info("Final P\&L report saved to %s", report_path)
+            except Exception as exc:
+                logger.warning("Error writing P\&L report: %s", exc)
         # Cancel all open orders on clean shutdown
         if self.executor:
             try:

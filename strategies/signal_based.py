@@ -42,9 +42,9 @@ WEIGHT_SPREAD = 0.20
 # ── Tuning parameters ────────────────────────────────────────────────────────
 VOLUME_SPIKE_RATIO = 1.5        # volume must be 2× the stored baseline
 VALUE_PRICE_LOW = 0.05          # "underdog" price range
-VALUE_PRICE_HIGH = 0.45
+VALUE_PRICE_HIGH = 0.65
 VALUE_MIN_VOLUME = 1_000.0      # market must have real activity
-SPREAD_THRESHOLD_WIDE = 0.04    # spread > 10 cents = "wide"
+SPREAD_THRESHOLD_WIDE = 0.02    # spread > 2 cents = "wide"
 MOMENTUM_THRESHOLD = 0.015      # 1.5-cent directional move = "strong"
 
 # Limit price offset: place order this many cents ABOVE current ask
@@ -258,7 +258,7 @@ class SignalBasedStrategy(BaseStrategy):
             return 0.0
 
         # Only score if ask price is in a range where upside is realistic
-        if not (0.05 <= token.best_ask <= 0.50):
+        if not (0.05 <= token.best_ask <= 0.70):
             return 0.0
 
         # Normalise: 10-cent spread → 0.5, 20-cent → 1.0

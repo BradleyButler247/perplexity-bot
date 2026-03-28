@@ -80,6 +80,10 @@ class CopyTradingStrategy(BaseStrategy):
         # or repeated API responses.  market_id -> timestamp of last signal
         self._market_signalled: Dict[str, float] = {}
 
+        # Track which token_id we bet on per market to prevent betting both sides.
+        # market_id -> token_id we already bought
+        self._market_side_taken: Dict[str, str] = {}
+
     def scan(self) -> List[TradeSignal]:
         """
         Fetch recent target wallet activity and generate mirror signals.
@@ -283,17 +287,49 @@ class CopyTradingStrategy(BaseStrategy):
             self.log.debug("Trade %s missing token/market IDs.", trade_id)
             return None
 
-        # Prevent duplicate signals on the same market within a 5-minute window.
-        # This catches cases where multiple wallets trade the same market,
-        # or the API returns the same trade with different IDs.
+        # ── Conflict prevention ────────────────────────────────────────
+        # 1. Market cooldown: don't signal same market within 5 minutes
         last_signal_time = self._market_signalled.get(market_id, 0)
-        if time.time() - last_signal_time < 300:  # 5-minute cooldown per market
+        if time.time() - last_signal_time < 300:
             self.log.debug(
                 "Market %s already signalled %.0fs ago; skipping duplicate.",
                 market_id[:16],
                 time.time() - last_signal_time,
             )
             return None
+
+        # 2. Both-sides prevention: if we already bet on a different token
+        #    in this market (e.g., wallet A says Yes, wallet B says No),
+        #    don't take the opposite side — that cancels out our position.
+        existing_token = self._market_side_taken.get(market_id)
+        if existing_token and existing_token != token_id:
+            self.log.info(
+                "Both-sides blocked: market %s already has token %s, "
+                "rejecting opposite token %s from wallet %s.",
+                market_id[:16], existing_token[:16],
+                token_id[:16], wallet[:10],
+            )
+            return None
+
+        # 3. Check existing open positions — don't enter a market where
+        #    we already hold a position (prevents stacking on same market)
+        if hasattr(self, 'market_scanner') and self.market_scanner:
+            try:
+                from position_tracker import PositionTracker
+                tracker = getattr(self, '_position_tracker', None)
+                if tracker is None:
+                    # Try to get it from the risk manager
+                    tracker = getattr(self.risk_manager, 'tracker', None)
+                if tracker:
+                    for pos in tracker.get_all_positions():
+                        if pos.market_id == market_id:
+                            self.log.debug(
+                                "Already hold position in market %s; skipping duplicate.",
+                                market_id[:16],
+                            )
+                            return None
+            except Exception:
+                pass  # Position tracker not accessible, skip check
 
         # Trade price at which target bought
         target_price = float(trade.get("price") or trade.get("avgPrice") or 0)
@@ -387,6 +423,8 @@ class CopyTradingStrategy(BaseStrategy):
 
         # Record this market so we don't signal it again within the cooldown
         self._market_signalled[market_id] = time.time()
+        # Record which side we took to prevent betting both sides
+        self._market_side_taken[market_id] = token_id
 
         # Add 1¢ above ask to improve fill rate.
         # GTC at exact ask often sits behind other orders and never fills.

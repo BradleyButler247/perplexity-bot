@@ -203,11 +203,29 @@ class LPRewardsStrategy(BaseStrategy):
                     m["rewardPool"] = f"${liquidity:,.0f}"
                     reward_markets.append(m)
 
+            # Fallback: if no reward markets found, use top 5 by volume
+            if not reward_markets and markets:
+                self.log.info(
+                    "LP rewards: no reward markets found via liquidity filter; "
+                    "falling back to top 5 markets by volume."
+                )
+                sorted_by_volume = sorted(
+                    markets,
+                    key=lambda x: float(x.get("volume", 0) or 0),
+                    reverse=True,
+                )
+                for m in sorted_by_volume[:5]:
+                    m["rewardPool"] = "volume_fallback"
+                    reward_markets.append(m)
+
             # Sort by liquidity descending (proxy for reward pool size)
             reward_markets.sort(
                 key=lambda x: float(x.get("liquidity", 0) or 0), reverse=True
             )
 
+            self.log.info(
+                "LP rewards: %d reward market(s) found.", len(reward_markets)
+            )
             self._reward_cache = reward_markets
             self._reward_cache_ts = now
             return reward_markets

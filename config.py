@@ -48,7 +48,7 @@ class Config:
     KILL_SWITCH_THRESHOLD: float = -100.0
 
     # ── Strategy tuning ───────────────────────────────────────────────────
-    ARBITRAGE_MIN_EDGE: float = 0.02
+    ARBITRAGE_MIN_EDGE: float = 0.01
     COPY_TRADE_SIZE: float = 10.0
     COPY_TRADE_MAX_AGE: int = 120   # seconds
     SIGNAL_MIN_EDGE: float = 0.01
