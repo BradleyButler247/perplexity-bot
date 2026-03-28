@@ -146,7 +146,17 @@ class TradeManager:
         return self._meta[pos.token_id]
 
     # Strategies that always hold to resolution regardless of config
-    ALWAYS_HOLD_TO_RESOLUTION = {"crypto_mean_reversion"}
+    ALWAYS_HOLD_TO_RESOLUTION = {"crypto_mean_reversion", "weather_forecast_arb"}
+
+    # Categories where prices swing wildly during live events.
+    # These get aggressive trailing stops and should NEVER hold to resolution.
+    LIVE_EVENT_CATEGORIES = {"sports", "esports"}
+
+    # Aggressive trailing stop for live events: activate at +20% gain,
+    # trail by 15% from the high-water mark. This catches situations like
+    # the Spartans game where price hit 50¢ from 14¢ entry then crashed.
+    LIVE_EVENT_TRAIL_ACTIVATION = 0.20   # Activate after +20% unrealised gain
+    LIVE_EVENT_TRAIL_PCT = 0.15          # 15% trailing stop from HWM
 
     # Partial exit: sell this fraction at the first profit target
     PARTIAL_EXIT_FRACTION = 0.50   # Sell 50%
@@ -257,13 +267,39 @@ class TradeManager:
                     )
                 return result
 
+        # ── Detect live event categories (sports/esports) ─────────────────
+        strategy_name = getattr(pos, 'strategy', '') or ''
+        market_category = self._detect_category(pos)
+        is_live_event = market_category in self.LIVE_EVENT_CATEGORIES
+
+        # ── Live event aggressive trailing stop ───────────────────────────
+        # Sports/esports prices swing wildly during games. If we're up 20%+,
+        # activate a tight 15% trailing stop to lock in profits.
+        # This prevents the Spartans scenario: bought at 14¢, hit 50¢, crashed to 2.5¢.
+        if is_live_event and pnl_pct >= self.LIVE_EVENT_TRAIL_ACTIVATION:
+            trail_price = meta.high_water_mark * (1.0 - self.LIVE_EVENT_TRAIL_PCT)
+            if current_price <= trail_price:
+                return self._exit_position(
+                    pos,
+                    meta,
+                    reason=(
+                        f"Live event trailing stop: price={current_price:.4f} "
+                        f"<= trail={trail_price:.4f} "
+                        f"(hwm={meta.high_water_mark:.4f}, entry={pos.entry_price:.4f}, "
+                        f"gain_was={pnl_pct:.0%}, cat={market_category})"
+                    ),
+                    order_type="FOK",
+                )
+
         # ── v34: Hold-to-resolution check ──────────────────────────────────
         # When HOLD_TO_RESOLUTION is enabled, skip TP/time exits unless EV
-        # has flipped negative (checked via Bayesian re-eval cache).
+        # has flipped negative. NEVER hold sports/esports to resolution.
+        is_hold_strategy = strategy_name in self.ALWAYS_HOLD_TO_RESOLUTION
         hold_override = (
-            self.cfg.HOLD_TO_RESOLUTION
-            and pnl_pct > -self.cfg.STOP_LOSS_PCT  # Not at stop-loss level
-            and not self._ev_is_negative(pos)       # EV hasn't flipped
+            (self.cfg.HOLD_TO_RESOLUTION or is_hold_strategy)
+            and not is_live_event                      # Never hold sports/esports
+            and pnl_pct > -self.cfg.STOP_LOSS_PCT      # Not at stop-loss level
+            and not self._ev_is_negative(pos)           # EV hasn't flipped
         )
 
         # ── 4. Take-profit (full exit at +15% for remaining shares) ──────
@@ -411,6 +447,20 @@ class TradeManager:
     # ─────────────────────────────────────────────────────────────────────────
     # v34: Base rate, hold-to-resolution, Bayesian re-evaluation
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _detect_category(self, pos: Position) -> str:
+        """
+        Detect the market category for a position.
+
+        Uses the market scanner to look up the question text, then classifies it.
+        Falls back to 'other' if the market isn't in the scanner cache.
+        """
+        if not self.market_scanner:
+            return "other"
+        market = self.market_scanner.get_market(pos.market_id)
+        if not market:
+            return "other"
+        return classify_market(market.question)
 
     def estimate_category_base_rate(self, market_category: str) -> float:
         """

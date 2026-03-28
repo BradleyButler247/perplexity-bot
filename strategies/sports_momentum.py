@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Minimum price velocity to trigger (cents per observation cycle)
 # A 5-cent move in one cycle (~10-15 seconds) suggests a live event
-MIN_PRICE_VELOCITY = 0.03  # 3 cents per cycle
+MIN_PRICE_VELOCITY = 0.015  # 1.5 cents per cycle
 
 # Volume spike: current cycle volume must be this multiple of average
 VOLUME_SPIKE_RATIO = 3.0
@@ -259,7 +259,7 @@ class SportsMomentumStrategy(BaseStrategy):
         confidence = min(confidence, 0.90)
 
         # Need reasonable confidence
-        if confidence < 0.40:
+        if confidence < 0.30:
             return None
 
         # ── Build signal ────────────────────────────────────────────────────

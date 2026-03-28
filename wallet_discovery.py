@@ -46,7 +46,7 @@ SCORE_DELTA_DRAWDOWN    = 0.15
 MAX_INACTIVE_DAYS = 14  # Increased from 7
 
 # Strict quality filters (v34)
-MIN_RESOLVED_TRADES = 80          # Up from 20
+MIN_RESOLVED_TRADES = 10          # Lowered; API paginates at 10 by default
 MAX_SINGLE_TRADE_PNL_PCT = 0.30   # No single trade > 30% of total PnL
 AVG_ENTRY_PRICE_LOW = 0.25        # Average entry between 25c-65c
 AVG_ENTRY_PRICE_HIGH = 0.65
@@ -166,6 +166,14 @@ class WalletDiscovery:
             List of wallet address strings, up to MAX_COPY_WALLETS.
         """
         return [w.proxy_wallet for w in self.discover(force=force)]
+
+    def get_wallet_profile(self, address: str) -> Optional[WalletProfile]:
+        """Look up a wallet's full profile from the cache."""
+        addr = address.lower()
+        for w in self._cache:
+            if w.proxy_wallet == addr:
+                return w
+        return None
 
     def get_wallet_categories(self, address: str) -> List[str]:
         """
@@ -677,7 +685,7 @@ class WalletDiscovery:
             List of position dicts.
         """
         url = f"{DATA_API}/closed-positions"
-        params = {"user": wallet}
+        params = {"user": wallet, "limit": 500}
         try:
             resp = self._session.get(url, params=params, timeout=15)
             resp.raise_for_status()

@@ -96,16 +96,16 @@ class OptimizerState:
 
     # Strategy allocation weights (sum to 1.0)
     strategy_weights: Dict[str, float] = field(default_factory=lambda: {
-        STRATEGY_ARBITRAGE: 0.10,
-        STRATEGY_COPY_TRADING: 0.10,
-        STRATEGY_SIGNAL_BASED: 0.10,
-        STRATEGY_CRYPTO_MR: 0.10,
-        STRATEGY_CONTRARIAN: 0.10,
-        STRATEGY_AI: 0.10,
-        STRATEGY_SPORTS: 0.10,
-        STRATEGY_CROSS_ARB: 0.10,
-        STRATEGY_WEATHER: 0.10,
-        STRATEGY_LP: 0.10,
+        STRATEGY_ARBITRAGE: 1.0,
+        STRATEGY_COPY_TRADING: 1.0,
+        STRATEGY_SIGNAL_BASED: 1.0,
+        STRATEGY_CRYPTO_MR: 1.0,
+        STRATEGY_CONTRARIAN: 1.0,
+        STRATEGY_AI: 1.0,
+        STRATEGY_SPORTS: 1.0,
+        STRATEGY_CROSS_ARB: 1.0,
+        STRATEGY_WEATHER: 1.0,
+        STRATEGY_LP: 1.0,
     })
 
     # Tunable parameters — current values (mutated by optimizer)
@@ -215,22 +215,28 @@ class StrategyOptimizer:
 
     def get_strategy_weight(self, strategy_name: str) -> float:
         """Return the current weight for a strategy (0.0–1.0)."""
-        return self.state.strategy_weights.get(strategy_name, 0.10)
+        return self.state.strategy_weights.get(strategy_name, 1.0)
 
     def should_execute_signal(self, signal) -> bool:
         """
-        Probabilistic gate: allow or suppress a signal based on strategy weight.
+        Deterministic gate: allow or suppress a signal based on strategy weight
+        and signal confidence.
 
-        A strategy with weight 1.0 always passes.  A strategy with weight 0.1
-        only passes ~10% of the time.  This avoids hard cutoffs and allows
-        all strategies to continue generating some data even when underperforming.
+        A strategy with weight 1.0 allows all signals regardless of confidence.
+        A strategy with weight 0.5 requires confidence >= 0.50 to pass.
+        A strategy with weight 0.1 requires confidence >= 0.90 to pass.
 
-        All strategies always get at least a 10% floor to prevent starvation.
+        Formula: allow if signal.confidence >= (1.0 - effective_weight)
+
+        This means high-confidence signals always get through even from
+        low-weight strategies, while low-confidence signals only pass
+        from high-weight (proven) strategies.
         """
         weight = self.get_strategy_weight(signal.strategy)
-        # Floor: always allow at least 10% through
+        # Floor: always allow signals with confidence >= 0.90
         effective_weight = max(weight, 0.10)
-        return random.random() < effective_weight
+        min_confidence = 1.0 - effective_weight
+        return signal.confidence >= min_confidence
 
     def get_tuned_param(self, param_name: str, default: float) -> float:
         """

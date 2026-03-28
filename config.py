@@ -51,7 +51,7 @@ class Config:
     ARBITRAGE_MIN_EDGE: float = 0.02
     COPY_TRADE_SIZE: float = 10.0
     COPY_TRADE_MAX_AGE: int = 120   # seconds
-    SIGNAL_MIN_EDGE: float = 0.02
+    SIGNAL_MIN_EDGE: float = 0.01
     MAX_SLIPPAGE: float = 0.03
 
     # ── Trade management (take-profit / stop-loss / exits) ─────────────
@@ -65,7 +65,7 @@ class Config:
     AUTO_DISCOVER_WALLETS: bool = True
     WALLET_DISCOVERY_INTERVAL: int = 21600   # Re-discover every 6 hours
     MIN_WIN_RATE: float = 0.55               # Minimum 55% win rate to qualify
-    MIN_CLOSED_POSITIONS: int = 20           # Require at least 20 closed positions
+    MIN_CLOSED_POSITIONS: int = 10           # Require at least 10 closed positions
     MAX_COPY_WALLETS: int = 3                # Follow top N discovered wallets
     WALLET_CATEGORIES: str = "OVERALL"      # Comma-separated leaderboard categories
 

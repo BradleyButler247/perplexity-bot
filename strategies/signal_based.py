@@ -45,7 +45,7 @@ VALUE_PRICE_LOW = 0.05          # "underdog" price range
 VALUE_PRICE_HIGH = 0.45
 VALUE_MIN_VOLUME = 1_000.0      # market must have real activity
 SPREAD_THRESHOLD_WIDE = 0.04    # spread > 10 cents = "wide"
-MOMENTUM_THRESHOLD = 0.03       # 8-cent directional move = "strong"
+MOMENTUM_THRESHOLD = 0.015      # 1.5-cent directional move = "strong"
 
 # Limit price offset: place order this many cents ABOVE current ask
 LIMIT_ABOVE_ASK = 0.01

@@ -47,14 +47,14 @@ logger = logging.getLogger(__name__)
 # ── Configuration ────────────────────────────────────────────────────────────
 
 # Entry: only buy shares priced at or below this (deep mispricings only)
-MAX_ENTRY_PRICE = 0.40      # 40¢ — NOAA-backed bets should be cheap
+MAX_ENTRY_PRICE = 0.50      # 50¢ — allow slightly higher entries
 MIN_ENTRY_PRICE = 0.02      # 2¢ floor — avoid dust/dead markets
 
 # Exit: sell when price reaches this level (don't always wait for resolution)
 EXIT_THRESHOLD = 0.55       # Sell at 55¢+ for solid profit on <40¢ entries
 
 # Minimum edge: forecast probability minus market price must exceed this
-MIN_EDGE = 0.20             # 20 percentage points minimum edge
+MIN_EDGE = 0.12             # 12 percentage points minimum edge
 
 # Minimum forecast confidence to act on
 MIN_FORECAST_CONFIDENCE = 0.60  # Only trade when forecast says ≥60% likely
@@ -300,7 +300,7 @@ class WeatherForecastArbStrategy(BaseStrategy):
         confidence = max(0.0, min(confidence, 1.0))
 
         # Minimum confidence gate
-        if confidence < 0.40:
+        if confidence < 0.30:
             return None
 
         # ── Build signal ────────────────────────────────────────────────────

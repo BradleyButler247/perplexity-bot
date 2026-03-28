@@ -300,6 +300,17 @@ class CopyTradingStrategy(BaseStrategy):
         if target_price <= 0 or target_price >= 1.0:
             return None
 
+        # ── Price cap: skip entries above 90¢ ────────────────────────────
+        # At 90¢+ the risk/reward is terrible for micro trades.
+        # Risking 90¢ to win 10¢ means one loss wipes 9 wins.
+        COPY_MAX_PRICE = 0.90
+        if target_price > COPY_MAX_PRICE:
+            self.log.debug(
+                "Trade %s from %s above price cap (%.2f > %.2f); skipping.",
+                trade_id, wallet[:10], target_price, COPY_MAX_PRICE,
+            )
+            return None
+
         # Current market price: check it hasn't drifted too far
         market = self.market_scanner.get_market(market_id)
         current_ask: float = target_price  # fallback if market not cached
@@ -347,9 +358,19 @@ class CopyTradingStrategy(BaseStrategy):
             return None
         size = self.cfg.COPY_TRADE_SIZE / current_ask
 
-        # Determine confidence and source label
+        # ── Dynamic confidence scoring ───────────────────────────────────
+        # Instead of flat 0.70, confidence is calculated from:
+        #   1. Wallet quality (score, win rate, PnL)
+        #   2. Trade quality (entry price sweet spot)
+        #   3. Market quality (volume, category match)
         is_manual = bool(self.cfg.TARGET_WALLET)
-        confidence = BASE_CONFIDENCE if is_manual else DISCOVERED_CONFIDENCE
+        if is_manual:
+            confidence = BASE_CONFIDENCE
+        else:
+            confidence = self._calculate_copy_confidence(
+                wallet, target_price, market
+            )
+
         source_label = (
             f"Manual:{wallet[:10]}…"
             if is_manual
@@ -360,22 +381,27 @@ class CopyTradingStrategy(BaseStrategy):
             f"Mirror {source_label} | "
             f"target_price={target_price:.3f} | "
             f"current_ask={current_ask:.3f} | "
-            f"drift={price_drift:.4f}"
+            f"drift={price_drift:.4f} | "
+            f"conf={confidence:.2f}"
         )
 
         # Record this market so we don't signal it again within the cooldown
         self._market_signalled[market_id] = time.time()
+
+        # Add 1¢ above ask to improve fill rate.
+        # GTC at exact ask often sits behind other orders and never fills.
+        fill_price = round(min(current_ask + 0.01, 0.99), 4)
 
         return TradeSignal(
             strategy=self.name(),
             market_id=market_id,
             token_id=token_id,
             side="BUY",
-            price=round(current_ask, 4),
+            price=fill_price,
             size=round(size, 4),
             confidence=confidence,
             reason=reason,
-            order_type="GTC",   # use limit order at current ask
+            order_type="GTC",   # limit order 1¢ above ask for better fills
         )
 
 
@@ -400,4 +426,70 @@ class CopyTradingStrategy(BaseStrategy):
                 return classify_market(m.question)
 
         return None
+
+    def _calculate_copy_confidence(self, wallet: str, entry_price: float, market) -> float:
+        """
+        Calculate dynamic confidence for a copy trade based on:
+
+        1. Wallet score (0-1): how well the wallet ranks overall
+        2. Wallet win rate: raw historical accuracy
+        3. Entry price quality (25-65¢ sweet spot)
+        4. Market volume: higher volume = more liquid = safer
+        5. Bot bonus: profitable bots are more consistent
+
+        Returns confidence in range [0.30, 0.95].
+        """
+        confidence = 0.0
+
+        # ── 1. Wallet quality (up to 0.40) ──────────────────────────────
+        profile = None
+        if self._wallet_discovery:
+            profile = self._wallet_discovery.get_wallet_profile(wallet)
+
+        if profile:
+            # Wallet composite score (already 0-1)
+            confidence += profile.score * 0.30  # Up to 0.30
+
+            # Win rate bonus
+            if profile.win_rate >= 0.90:
+                confidence += 0.10
+            elif profile.win_rate >= 0.70:
+                confidence += 0.05
+        else:
+            # No profile (manual wallet) — default moderate
+            confidence += 0.15
+
+        # ── 2. Entry price quality (up to 0.30) ─────────────────────────
+        if 0.25 <= entry_price <= 0.65:
+            # Sweet spot: best risk/reward
+            confidence += 0.30
+        elif 0.15 <= entry_price < 0.25 or 0.65 < entry_price <= 0.80:
+            # Acceptable range
+            confidence += 0.20
+        elif entry_price < 0.15:
+            # Cheap lottery ticket — lower confidence
+            confidence += 0.10
+        else:
+            # 80-90¢ — poor risk/reward
+            confidence += 0.05
+
+        # ── 3. Market volume (up to 0.15) ──────────────────────────────
+        if market:
+            vol = max(getattr(market, 'volume', 0), getattr(market, 'liquidity', 0))
+            if vol >= 1_000_000:
+                confidence += 0.15  # Very liquid
+            elif vol >= 100_000:
+                confidence += 0.10
+            elif vol >= 10_000:
+                confidence += 0.05
+
+        # ── 4. Bot bonus (up to 0.10) ─────────────────────────────────
+        # Profitable bots tend to be more consistent than humans
+        if profile and profile.is_likely_bot and profile.pnl > 0:
+            confidence += 0.10
+
+        # Clamp to valid range
+        confidence = max(0.30, min(0.95, confidence))
+
+        return round(confidence, 2)
 

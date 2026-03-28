@@ -76,7 +76,7 @@ SWEET_SPOT_LOW = 0.40
 SWEET_SPOT_HIGH = 0.60
 
 # Mean reversion: buy when token is below this relative to its recent average
-MEAN_REVERSION_THRESHOLD = 0.85  # Buy when price is 85% or less of recent avg
+MEAN_REVERSION_THRESHOLD = 0.92  # Buy when price is 92% or less of recent avg
 
 # Minimum spread to avoid buying into tight/efficient markets
 MIN_SPREAD = 0.02  # 2¢ minimum spread
@@ -330,7 +330,7 @@ class CryptoMeanReversionStrategy(BaseStrategy):
         confidence = max(0.0, min(confidence, 1.0))
 
         # ── Minimum confidence gate ─────────────────────────────────────────
-        if confidence < 0.40:
+        if confidence < 0.30:
             return None
 
         # ── Build signal ────────────────────────────────────────────────────
