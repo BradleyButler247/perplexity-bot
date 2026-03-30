@@ -494,6 +494,23 @@ class StrategyOptimizer:
             score = 0.50 * wr_score + 0.30 * pf_score + 0.20 * sh_score
             scores[strat_name] = max(score, 0.05)  # floor of 5%
 
+        # ── Streak Z-score multiplier ────────────────────────────────────────
+        # Boost hot streaks (z > 2.0) and reduce cold streaks (z < -2.0).
+        for strat_name in ALL_STRATEGIES:
+            z = self._compute_streak_zscore(strat_name)
+            if z > 2.0:
+                scores[strat_name] = scores.get(strat_name, 0.10) * 1.2
+                logger.debug(
+                    "Streak boost: %s z=%.2f > 2.0 → weight ×1.20",
+                    strat_name, z,
+                )
+            elif z < -2.0:
+                scores[strat_name] = scores.get(strat_name, 0.10) * 0.7
+                logger.debug(
+                    "Streak penalty: %s z=%.2f < -2.0 → weight ×0.70",
+                    strat_name, z,
+                )
+
         # ── Drawdown-based throttling ────────────────────────────────────────
         # Penalise strategies with negative Sharpe or negative total PnL.
         # Strategies with 5+ consecutive losses get a heavier reduction.
@@ -823,6 +840,74 @@ class StrategyOptimizer:
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _compute_streak_zscore(self, strategy_name: str) -> float:
+        """
+        Compute a streak Z-score for the last 20 trades of a strategy.
+
+        Measures whether the recent win/loss sequence is statistically
+        significant relative to the strategy's historical win rate.
+
+        Formula: z = (wins - expected_wins) / sqrt(n * p * (1-p))
+            where p = historical win rate, n = 20
+
+        Returns:
+            Z-score float.
+            z > +2.0 → hot streak (boost weight by 20%).
+            z < -2.0 → cold streak (reduce weight by 30%).
+            Otherwise 0.0.
+        """
+        records = self.trade_history.get_records()
+        # Filter to this strategy's BUY records (round-trip entries)
+        strat_records = [
+            r for r in records
+            if r.strategy == strategy_name and r.side == "BUY"
+        ]
+
+        n = 20
+        if len(strat_records) < n:
+            return 0.0
+
+        # Historical win rate over all available trades
+        all_buys = strat_records
+        # Build pairs to determine wins
+        all_records = records
+        sell_records = [r for r in all_records if r.strategy == strategy_name and r.side == "SELL"]
+
+        total_paired = 0
+        total_wins = 0
+        for buy in all_buys:
+            for sell in sell_records:
+                if sell.token_id == buy.token_id and sell.timestamp > buy.timestamp:
+                    total_paired += 1
+                    if sell.price > buy.price:
+                        total_wins += 1
+                    break
+
+        if total_paired < 5:
+            return 0.0
+
+        p = total_wins / total_paired  # historical win rate
+        if p <= 0 or p >= 1:
+            return 0.0
+
+        # Count wins in the last 20 trades
+        recent_buys = strat_records[-n:]
+        recent_wins = 0
+        for buy in recent_buys:
+            for sell in sell_records:
+                if sell.token_id == buy.token_id and sell.timestamp > buy.timestamp:
+                    if sell.price > buy.price:
+                        recent_wins += 1
+                    break
+
+        expected_wins = n * p
+        variance = n * p * (1.0 - p)
+        if variance <= 0:
+            return 0.0
+
+        z = (recent_wins - expected_wins) / math.sqrt(variance)
+        return z
 
     def _clamp_param(
         self, new_value: float, baseline: float, param_name: str

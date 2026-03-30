@@ -71,7 +71,7 @@ REDEEM_ABI = [
 
 
 # Cooldown between redemption attempts for the same condition (seconds)
-REDEEM_COOLDOWN = 600  # 10 minutes
+REDEEM_COOLDOWN = 120  # 2 minutes — check frequently for quick claims
 
 
 class Redeemer:
@@ -263,11 +263,16 @@ class Redeemer:
                 if size <= 0:
                     continue
 
-                # Check if the market has resolved
-                # resolved=True or curPrice is exactly 0 or 1 (binary outcome)
+                # Check if the market has resolved.
+                # Markets resolve at exactly 0 or 1, but the API sometimes
+                # reports 0.99/0.01 or the 'resolved' flag. Be aggressive.
                 is_resolved = p.get("resolved") is True
                 cur_price = float(p.get("curPrice", -1) or -1)
-                if not is_resolved and cur_price not in (0.0, 1.0):
+                end_date = p.get("endDate") or p.get("end_date") or ""
+
+                # Treat as resolved if: flag set, price at extreme, or market ended
+                price_is_extreme = (cur_price >= 0.95 or (0 <= cur_price <= 0.05))
+                if not is_resolved and not price_is_extreme:
                     continue
 
                 # This is a resolved position still held — likely a loss

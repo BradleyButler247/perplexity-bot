@@ -96,12 +96,18 @@ class Executor:
         result = executor.execute(signal)
     """
 
+    # Heartbeat interval: send a heartbeat every 30 seconds to keep
+    # the connection alive and enable auto-cancel on disconnect.
+    HEARTBEAT_INTERVAL = 30
+
     def __init__(self, cfg: Config, client: ClobClient) -> None:
         self.cfg = cfg
         self.client = client
         self._order_timestamps: list = []   # timestamps of recent orders
         self._cached_balance: float = -1.0  # last known USDC balance (-1 = unknown)
         self._balance_ts: float = 0.0       # timestamp of last balance check
+        self._heartbeat_id: str = ""        # heartbeat session ID
+        self._last_heartbeat: float = 0.0   # timestamp of last heartbeat sent
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -217,6 +223,43 @@ class Executor:
         except Exception as exc:
             logger.error("Failed to cancel all orders: %s", exc)
             return False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Heartbeat API
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def send_heartbeat(self) -> None:
+        """
+        Send a heartbeat to Polymarket to keep the session alive.
+
+        The HeartBeat API serves two purposes:
+          1. Keeps the connection alive (prevents order staleness).
+          2. When a heartbeat_id is set, if the bot stops sending heartbeats
+             (crash, disconnect), Polymarket auto-cancels all open orders
+             associated with that heartbeat_id after ~30 seconds.
+
+        This prevents ghost orders sitting on the book after a VPS crash.
+        Call this once per cycle (every 15-30 seconds).
+        """
+        if self.cfg.TRADING_MODE == "paper":
+            return
+
+        now = time.time()
+        if now - self._last_heartbeat < self.HEARTBEAT_INTERVAL:
+            return  # Too soon, skip
+
+        try:
+            # If we don't have a heartbeat ID yet, the first call creates one
+            resp = self.client.post_heartbeat(self._heartbeat_id or None)
+            if resp and isinstance(resp, dict):
+                new_id = resp.get("heartbeat_id") or resp.get("id", "")
+                if new_id:
+                    self._heartbeat_id = new_id
+            self._last_heartbeat = now
+            logger.debug("Heartbeat sent (id=%s)", self._heartbeat_id[:16] if self._heartbeat_id else "new")
+        except Exception as exc:
+            # Non-fatal — heartbeat failure shouldn't stop trading
+            logger.debug("Heartbeat failed: %s", exc)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Internal helpers
@@ -393,7 +436,10 @@ class Executor:
 
         try:
             signed = self.client.create_order(order_args)
-            resp = self.client.post_order(signed, OrderType.GTC)
+            # Use Post Only: order is rejected if it would immediately match.
+            # This guarantees we're always a maker (0% fee) instead of taker
+            # (up to 1.56% fee on crypto markets).
+            resp = self.client.post_order(signed, OrderType.GTC, post_only=True)
             self._record_order()
 
             order_id = resp.get("orderID") or resp.get("id", "unknown")
@@ -401,7 +447,7 @@ class Executor:
 
             prefix = "[MICRO]" if mode == "micro" else "[LIVE]"
             logger.info(
-                "%s GTC order placed: %s %s shares @ $%.4f | id=%s status=%s",
+                "%s GTC+PostOnly order placed: %s %s shares @ $%.4f | id=%s status=%s",
                 prefix,
                 signal.side,
                 signal.size,

@@ -30,13 +30,12 @@ Fee calculation example:
 import logging
 from typing import List
 
+from constants import POLYMARKET_FEE
 from strategies.base import BaseStrategy, TradeSignal
 from market_scanner import MarketInfo
 
 logger = logging.getLogger(__name__)
 
-# Polymarket fee on winnings (2% = 0.02)
-POLYMARKET_FEE = 0.02
 
 # Minimum order size in shares (avoid dust orders)
 MIN_ORDER_SIZE = 1.0

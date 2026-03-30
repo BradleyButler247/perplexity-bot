@@ -302,6 +302,21 @@ class TradeManager:
             and not self._ev_is_negative(pos)           # EV hasn't flipped
         )
 
+        # ── Smart exit: edge erosion ─────────────────────────────────────────
+        # If the gap between estimated probability and current price
+        # has narrowed to <5%, the edge is gone — take profits.
+        if current_price > pos.entry_price and not hold_override:
+            # Use current_price as proxy for market-implied probability
+            # If price has risen significantly from entry but the remaining
+            # upside (1.0 - current_price) is small, exit
+            remaining_edge = 1.0 - current_price
+            if remaining_edge < 0.05 and pnl_pct > 0:
+                return self._exit_position(
+                    pos, meta,
+                    reason=f"Edge erosion: remaining_edge={remaining_edge:.2f} < 0.05 (price={current_price:.3f})",
+                    order_type="GTC",
+                )
+
         # ── 4. Take-profit (full exit at +15% for remaining shares) ──────
         if pnl_pct >= self.cfg.TAKE_PROFIT_PCT and not hold_override:
             return self._exit_position(

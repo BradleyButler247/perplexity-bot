@@ -266,14 +266,17 @@ class CryptoMeanReversionStrategy(BaseStrategy):
         # ── Update price history ────────────────────────────────────────────
         self._update_price_history(token)
 
-        # ── Mean reversion check ────────────────────────────────────────────
-        avg_price = self._get_average_price(token.token_id)
-        if avg_price <= 0:
-            # Not enough history yet — this is the first observation
+        # ── Mean reversion check (sigma-based) ─────────────────────────────
+        avg_price, std_price = self._get_price_stats(token.token_id)
+        if avg_price <= 0 or std_price <= 0:
+            # Not enough history yet
             return None
 
-        # Buy when current price is below the recent average (mean reversion)
-        if price > avg_price * MEAN_REVERSION_THRESHOLD:
+        # Calculate z-score: how many standard deviations below the mean
+        z_score = (price - avg_price) / std_price
+
+        # Only buy when price is significantly below average (z < -2.0)
+        if z_score > MEAN_REVERSION_SIGMA:
             return None
 
         # ── Compute confidence score ────────────────────────────────────────
@@ -289,8 +292,8 @@ class CryptoMeanReversionStrategy(BaseStrategy):
             confidence += 0.10
 
         # Mean reversion depth (how far below average)
-        reversion_depth = 1.0 - (price / avg_price)
-        confidence += min(reversion_depth * 2.0, 0.20)
+        reversion_depth = abs(z_score) / 4.0  # Normalise: -4σ = max depth
+        confidence += min(reversion_depth * 0.30, 0.20)
 
         # Volume score
         if market.volume > 10000:
@@ -363,7 +366,7 @@ class CryptoMeanReversionStrategy(BaseStrategy):
         bi_str = f"{binance_info} | " if binance_info else ""
         reason = (
             f"Crypto MR [{asset}] {token.outcome} @ {price:.3f} | "
-            f"avg={avg_price:.3f} | reversion={reversion_depth:.1%} | "
+            f"avg={avg_price:.3f} | z={z_score:.2f}σ | "
             f"spread={spread:.3f} | payoff={expected_payoff:.0%} | "
             f"{bi_str}"
             f"{market.question[:50]}"
@@ -409,6 +412,18 @@ class CryptoMeanReversionStrategy(BaseStrategy):
 
         prices = [p for _, p in history]
         return sum(prices) / len(prices)
+
+    def _get_price_stats(self, token_id: str) -> tuple:
+        """Get mean and standard deviation of recent prices."""
+        import statistics
+        history = self._price_history.get(token_id, [])
+        if len(history) < 5:
+            return 0.0, 0.0  # Need at least 5 observations for std dev
+
+        prices = [p for _, p in history]
+        avg = sum(prices) / len(prices)
+        std = statistics.stdev(prices) if len(prices) >= 2 else 0.0
+        return avg, std
 
     # ─────────────────────────────────────────────────────────────────────────
     # External crypto price data

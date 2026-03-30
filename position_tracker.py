@@ -219,9 +219,11 @@ class PositionTracker:
     def realised_pnl(self) -> float:
         return self._realised_pnl
 
-    def get_all_positions(self) -> List[Position]:
-        """Return all tracked positions (open and resolved)."""
-        return list(self._positions.values())
+    def get_all_positions(self, include_resolved: bool = False) -> List[Position]:
+        """Return tracked positions. By default only open (non-resolved) ones."""
+        if include_resolved:
+            return list(self._positions.values())
+        return [p for p in self._positions.values() if not p.resolved]
 
     def summary(self) -> str:
         """Return a one-line portfolio summary."""
@@ -440,12 +442,24 @@ class PositionTracker:
                     )
 
         # Clean up: remove resolved positions older than 1 hour
-        # to keep the tracker lean
+        # and stale positions with no price data older than 24 hours
         now = time.time()
-        to_remove = [
-            tid for tid, pos in self._positions.items()
-            if pos.resolved and (now - pos.opened_at) > 3600
-        ]
+        to_remove = []
+        for tid, pos in self._positions.items():
+            if pos.resolved and (now - pos.opened_at) > 3600:
+                to_remove.append(tid)
+            # Positions with current_price=0 for over 24h are stale —
+            # the market likely resolved and the Data API can't find them
+            elif pos.current_price <= 0 and (now - pos.opened_at) > 86400:
+                pos.resolved = True
+                pos.resolution_price = 0.0
+                loss = -pos.cost_basis
+                self._realised_pnl += loss
+                to_remove.append(tid)
+                logger.info(
+                    "Pruned stale position (no price for 24h+): %s | loss=$%.2f",
+                    tid[:16], loss,
+                )
         for tid in to_remove:
             del self._positions[tid]
-            logger.debug("Removed stale resolved position: %s", tid[:16])
+            logger.debug("Removed resolved/stale position: %s", tid[:16])

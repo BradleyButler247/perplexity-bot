@@ -44,6 +44,7 @@ from wallet_discovery import WalletDiscovery
 from strategy_optimizer import StrategyOptimizer
 from redeemer import Redeemer
 from pnl_tracker import PnLTracker
+from dashboard import start_dashboard_thread, write_dashboard_state
 from http_client import close_session
 from strategies import (
     ArbitrageStrategy,
@@ -446,6 +447,13 @@ class TradingBot:
         logger.info("Bot running. Press CTRL+C to stop.")
         print(f"\n  [{self._timestamp()}] Bot is live. Scanning every {self.cfg.POLL_INTERVAL}s.\n", flush=True)
 
+        # Start web dashboard in background thread
+        try:
+            start_dashboard_thread()
+            print(f"  [{self._timestamp()}] Dashboard live at http://204.168.191.123:8080\n", flush=True)
+        except Exception as exc:
+            logger.warning("Dashboard failed to start: %s", exc)
+
         cycle = 0
         while not self._shutdown:
             cycle += 1
@@ -482,6 +490,13 @@ class TradingBot:
         cycle_start = time.time()
         logger.info("─── Cycle %d [%s] ───", cycle, self.cfg.TRADING_MODE.upper())
         print(f"\n  ┌─── Cycle {cycle} [{self.cfg.TRADING_MODE.upper()}] " + "─" * 35, flush=True)
+
+        # ── 0. Heartbeat ───────────────────────────────────────────────────
+        # Send heartbeat to Polymarket to keep session alive.
+        # If the bot crashes, Polymarket auto-cancels all open orders
+        # after ~30s of missed heartbeats (prevents ghost orders).
+        if self.executor:
+            self.executor.send_heartbeat()
 
         # ── 1. Update market data ──────────────────────────────────────────
         self._print_status("📡 Fetching markets...")
@@ -668,6 +683,10 @@ class TradingBot:
                         usd_spent = (result.filled_price or signal.price) * (result.filled_size or signal.size)
                         self.risk_manager.update_pnl(-usd_spent)
 
+                        # Record trade into VPIN monitor for toxic flow detection
+                        if result.success and hasattr(self, 'risk_manager'):
+                            self.risk_manager.record_market_trade(signal.market_id, signal.side, signal.price * signal.size)
+
                         # Record to trade history
                         if self.trade_history:
                             self.trade_history.record_trade(result)
@@ -752,6 +771,9 @@ class TradingBot:
             self.risk_manager.daily_pnl,
         )
 
+        # ── 9a. Clean up stale/dangerous orders ───────────────────────────
+        self._cleanup_stale_orders()
+
         # ── 9. Show open orders ──────────────────────────────────────────────
         self._print_open_orders()
 
@@ -759,8 +781,37 @@ class TradingBot:
         # Update P&L tracker
         if hasattr(self, "pnl_tracker"):
             self.pnl_tracker.update()
-        # Print cycle summary line
+
+        # Update dashboard state
         cycle_elapsed = time.time() - cycle_start
+        try:
+            positions = self.tracker.get_all_positions() if self.tracker else []
+            unrealised = sum(
+                (p.current_price - p.entry_price) * p.size
+                for p in positions
+                if p.current_price > 0 and p.entry_price > 0
+            )
+            write_dashboard_state(
+                cycle=cycle,
+                positions=positions,
+                realised_pnl=self.tracker.realised_pnl if self.tracker else 0,
+                unrealised_pnl=unrealised,
+                daily_pnl=self.risk_manager.daily_pnl,
+                total_trades=len(self.trade_history.get_records()) if self.trade_history else 0,
+                open_orders=0,  # updated below
+                strategies_active=[s.name() for s in self.strategies],
+                signals_this_cycle=len(all_signals),
+                executed_this_cycle=executed,
+                filtered_this_cycle=optimizer_filtered,
+                kill_switch=self.risk_manager.kill_switch_active,
+                wallet_count=len(self.wallet_discovery.get_wallet_addresses()) if self.wallet_discovery else 0,
+                cycle_time=cycle_elapsed,
+                mode=self.cfg.TRADING_MODE,
+            )
+        except Exception as exc:
+            logger.debug("Dashboard state write error: %s", exc)
+
+        # Print cycle summary line
         pnl_str = f"${self.risk_manager.daily_pnl:+.2f}"
         history_count = len(self.trade_history.get_records()) if self.trade_history else 0
         print(
@@ -920,6 +971,99 @@ class TradingBot:
             f"  [{self._timestamp()}] ✅ Synced {synced} position(s) from Polymarket",
             flush=True,
         )
+
+    def _cleanup_stale_orders(self) -> int:
+        """
+        Cancel limit orders that are unlikely to fill or dangerous to keep.
+
+        Stale order criteria:
+          1. Price has moved >10% away from the order price (market left it behind)
+          2. Market is resolving (price at 95%+ or 5%-) — filling now = buying a loss
+          3. Order is older than MAX_HOLD_TIME (default 24h)
+
+        Returns number of orders cancelled.
+        """
+        cancelled = 0
+        try:
+            client = get_client()
+            orders = client.get_orders()
+            if not orders:
+                return 0
+
+            live_orders = [
+                o for o in orders
+                if o.get("status", "").lower() in ("live", "active", "open")
+            ]
+
+            for order in live_orders:
+                order_id = order.get("id", "")
+                if not order_id:
+                    continue
+
+                order_price = float(order.get("price", 0) or 0)
+                token_id = order.get("asset_id") or order.get("token_id", "")
+                side = order.get("side", "").upper()
+                created = float(order.get("created_at", 0) or order.get("timestamp", 0) or 0)
+
+                # Get current market price for this token
+                current_price = 0.0
+                if self.scanner and token_id:
+                    for market in self.scanner._cache.values():
+                        for token in market.tokens:
+                            if token.token_id == token_id:
+                                current_price = token.mid_price or token.best_bid
+                                break
+                        if current_price > 0:
+                            break
+
+                should_cancel = False
+                reason = ""
+
+                # Rule 1: Market resolving — price at extreme
+                # If we have a BUY order and the token price is 95%+, the market
+                # is resolving and we'd be buying at near-$1 (guaranteed loss on fees)
+                if current_price >= 0.95 and side == "BUY":
+                    should_cancel = True
+                    reason = f"market resolving (price={current_price:.2f})"
+                elif current_price <= 0.05 and side == "BUY" and order_price > 0.10:
+                    should_cancel = True
+                    reason = f"market collapsed (price={current_price:.2f}, order={order_price:.2f})"
+
+                # Rule 2: Price moved >15% away from order
+                if not should_cancel and current_price > 0 and order_price > 0:
+                    drift_pct = abs(current_price - order_price) / order_price
+                    if drift_pct > 0.15:
+                        should_cancel = True
+                        reason = f"price drifted {drift_pct:.0%} (order={order_price:.2f}, now={current_price:.2f})"
+
+                # Rule 3: Order too old (>12 hours)
+                if not should_cancel and created > 0:
+                    # Handle millisecond timestamps
+                    if created > 4_102_444_800:
+                        created /= 1000.0
+                    age_hours = (time.time() - created) / 3600
+                    if age_hours > 12:
+                        should_cancel = True
+                        reason = f"stale order ({age_hours:.1f}h old)"
+
+                if should_cancel:
+                    try:
+                        self.executor.cancel_order(order_id)
+                        cancelled += 1
+                        logger.info(
+                            "Cancelled stale order %s: %s %s @ $%.3f | %s",
+                            order_id[:16], side, token_id[:16] if token_id else "?",
+                            order_price, reason,
+                        )
+                    except Exception as exc:
+                        logger.debug("Failed to cancel stale order %s: %s", order_id[:16], exc)
+
+        except Exception as exc:
+            logger.debug("Stale order cleanup error: %s", exc)
+
+        if cancelled:
+            self._print_status(f"\U0001f9f9 Cancelled {cancelled} stale order(s)")
+        return cancelled
 
     def _print_open_orders(self) -> None:
         """

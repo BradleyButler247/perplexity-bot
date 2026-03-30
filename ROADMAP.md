@@ -4,6 +4,17 @@ Future development plans for the Polymarket Trading Bot.
 
 ---
 
+## Next Priority — Kalshi Integration
+
+### v41: Kalshi Client + Cross-Platform Arbitrage
+- Abstract exchange interface (shared by Polymarket and Kalshi)
+- kalshi_client.py mirroring the Polymarket client API
+- Cross-platform arbitrage: detect same-event price discrepancies
+- Unified signal format across both exchanges
+- Kalshi requires: KYC account, fiat funding, different fee structure
+
+---
+
 ## Implemented in v35 ✅
 
 ### Daily Drawdown Circuit Breaker

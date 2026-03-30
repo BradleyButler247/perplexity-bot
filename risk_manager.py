@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Dict
 
 from config import Config
 from strategies.base import TradeSignal
+from vpin_monitor import VPINMonitor
 
 if TYPE_CHECKING:
     from position_tracker import PositionTracker
@@ -51,6 +52,7 @@ class RiskManager:
         self._consecutive_loss_pause_until: float = 0.0
         # Rejection counter for monitoring
         self._rejections: Dict[str, int] = {}
+        self._vpin = VPINMonitor()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -93,6 +95,11 @@ class RiskManager:
                 signal,
                 "consecutive loss cooldown",
             )
+            return False
+
+        # ── VPIN toxic flow check ────────────────────────────────────────
+        if self._vpin.is_toxic(signal.market_id):
+            self._reject(signal, f"VPIN toxic flow detected in market {signal.market_id[:16]}")
             return False
 
         trade_usd = signal.price * signal.size
@@ -225,6 +232,25 @@ class RiskManager:
     @property
     def consecutive_losses(self) -> int:
         return self._consecutive_losses
+
+    def record_market_trade(self, market_id: str, side: str, usd_value: float) -> None:
+        """
+        Record an observed market trade into the VPIN monitor.
+
+        Call this after each successful execution so VPIN can track order flow
+        toxicity per market.
+
+        Args:
+            market_id:  The Polymarket market/condition ID.
+            side:       "BUY" or "SELL".
+            usd_value:  USD notional value of the trade.
+        """
+        self._vpin.record_trade(market_id, side, usd_value)
+
+    @property
+    def vpin_monitor(self) -> VPINMonitor:
+        """Return the underlying VPINMonitor instance."""
+        return self._vpin
 
     def rejection_summary(self) -> dict:
         """Return a dict of rejection reason -> count for monitoring."""
