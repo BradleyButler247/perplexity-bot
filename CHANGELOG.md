@@ -1,5 +1,28 @@
 # Changelog
 
+## v41 (2026-03-30)
+
+### Copy Trading Improvements
+
+- **Lowered Market Cooldown** (#5)
+  - Reduced from 300s (5 min) to 120s (2 min) between signals on the same market
+  - Faster reaction to evolving opportunities without losing dedup protection
+
+- **Wallet Tier System** (#6)
+  - Top 3 discovered wallets by composite score = "high confidence" tier
+  - High-confidence wallets bypass market cooldown entirely — their signals
+    are always acted on immediately
+  - Standard wallets still respect the 120s cooldown
+  - Tier assignment refreshed every scan cycle from WalletDiscovery cache
+  - Tier label (HIGH/STD) included in trade reason for dashboard visibility
+
+- **Profitable Re-Entry** (#7)
+  - Markets where a previous copy-trade position closed profitably are
+    eligible for re-entry, even if they appear in the cooldown/side-taken maps
+  - Profitable exit detected from: resolution WIN ($1) or sold above entry price
+  - Re-entry flag is consumed on use (one re-entry per profitable exit)
+  - Side-taken record is cleared on re-entry to allow fresh direction
+
 ## v34 (2026-03-27)
 
 ### New Features

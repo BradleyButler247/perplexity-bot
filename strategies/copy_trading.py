@@ -49,6 +49,14 @@ BASE_CONFIDENCE = 0.60
 # Slightly higher confidence for auto-discovered wallets that met quality gates
 DISCOVERED_CONFIDENCE = 0.70
 
+# ── Market cooldown (v41) ─────────────────────────────────────────────────
+# Standard wallets wait this long before re-signalling the same market.
+# Lowered from 300s (v40) to 120s to catch faster-moving opportunities.
+MARKET_COOLDOWN_STANDARD = 120   # 2 minutes
+
+# High-confidence wallets (top 3 by score) bypass market cooldown entirely.
+HIGH_CONFIDENCE_WALLET_COUNT = 3
+
 
 class CopyTradingStrategy(BaseStrategy):
     """
@@ -84,6 +92,18 @@ class CopyTradingStrategy(BaseStrategy):
         # market_id -> token_id we already bought
         self._market_side_taken: Dict[str, str] = {}
 
+        # ── v41: Wallet tier cache ────────────────────────────────────────
+        # Set of wallet addresses classified as "high confidence" (top N by
+        # composite score).  Refreshed each scan cycle from WalletDiscovery.
+        self._high_confidence_wallets: Set[str] = set()
+
+        # ── v41: Profitable exit tracking ─────────────────────────────────
+        # Markets where we previously held a copy-trade position that closed
+        # profitably.  These markets are eligible for re-entry even if they
+        # appear in _market_signalled or _market_side_taken.
+        # market_id -> True
+        self._profitable_exits: Dict[str, bool] = {}
+
     def scan(self) -> List[TradeSignal]:
         """
         Fetch recent target wallet activity and generate mirror signals.
@@ -99,6 +119,10 @@ class CopyTradingStrategy(BaseStrategy):
                 "Skipping copy-trading scan."
             )
             return []
+
+        # ── v41: Refresh wallet tiers + profitable exits ──────────────────
+        self._refresh_wallet_tiers()
+        self._refresh_profitable_exits()
 
         signals: List[TradeSignal] = []
 
@@ -287,16 +311,40 @@ class CopyTradingStrategy(BaseStrategy):
             self.log.debug("Trade %s missing token/market IDs.", trade_id)
             return None
 
+        # ── v41: Check if this is a profitable-exit re-entry ────────────
+        is_reentry = market_id in self._profitable_exits
+
         # ── Conflict prevention ────────────────────────────────────────
-        # 1. Market cooldown: don't signal same market within 5 minutes
+        # 1. Market cooldown (v41: tier-aware + re-entry bypass)
+        #    High-confidence wallets bypass cooldown entirely.
+        #    Profitable-exit markets are also exempt (re-entry allowed).
+        is_high_conf_wallet = wallet in self._high_confidence_wallets
         last_signal_time = self._market_signalled.get(market_id, 0)
-        if time.time() - last_signal_time < 300:
+        cooldown_elapsed = time.time() - last_signal_time
+
+        if not is_high_conf_wallet and not is_reentry:
+            if cooldown_elapsed < MARKET_COOLDOWN_STANDARD:
+                self.log.debug(
+                    "Market %s already signalled %.0fs ago (cooldown=%ds, tier=standard); skipping.",
+                    market_id[:16],
+                    cooldown_elapsed,
+                    MARKET_COOLDOWN_STANDARD,
+                )
+                return None
+        elif is_high_conf_wallet and last_signal_time > 0:
             self.log.debug(
-                "Market %s already signalled %.0fs ago; skipping duplicate.",
-                market_id[:16],
-                time.time() - last_signal_time,
+                "Market %s: high-confidence wallet %s bypasses cooldown (%.0fs ago).",
+                market_id[:16], wallet[:10], cooldown_elapsed,
             )
-            return None
+        elif is_reentry:
+            self.log.info(
+                "Market %s: re-entry allowed (previous position closed profitably).",
+                market_id[:16],
+            )
+            # Clear the profitable-exit flag so we don't re-enter endlessly
+            self._profitable_exits.pop(market_id, None)
+            # Also clear the stale side-taken record for this market
+            self._market_side_taken.pop(market_id, None)
 
         # 2. Both-sides prevention: if we already bet on a different token
         #    in this market (e.g., wallet A says Yes, wallet B says No),
@@ -407,14 +455,18 @@ class CopyTradingStrategy(BaseStrategy):
                 wallet, target_price, market
             )
 
+        # ── v41: Wallet tier label ────────────────────────────────────────
+        tier_label = "HIGH" if (not is_manual and wallet in self._high_confidence_wallets) else "STD"
+        reentry_label = " RE-ENTRY" if is_reentry else ""
+
         source_label = (
             f"Manual:{wallet[:10]}…"
             if is_manual
-            else f"Discovered:{wallet[:10]}…"
+            else f"Discovered:{wallet[:10]}…[{tier_label}]"
         )
 
         reason = (
-            f"Mirror {source_label} | "
+            f"Mirror {source_label}{reentry_label} | "
             f"target_price={target_price:.3f} | "
             f"current_ask={current_ask:.3f} | "
             f"drift={price_drift:.4f} | "
@@ -530,4 +582,105 @@ class CopyTradingStrategy(BaseStrategy):
         confidence = max(0.30, min(0.95, confidence))
 
         return round(confidence, 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # v41: Wallet tiers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _refresh_wallet_tiers(self) -> None:
+        """
+        Classify discovered wallets into tiers based on composite score.
+
+        Top HIGH_CONFIDENCE_WALLET_COUNT wallets (by WalletDiscovery score)
+        are tagged "high confidence" and bypass the per-market cooldown,
+        allowing them to signal faster and on markets other wallets already
+        touched.
+
+        Only applies to auto-discovered wallets (manual TARGET_WALLET is
+        always treated as standard tier since there's only one).
+        """
+        self._high_confidence_wallets.clear()
+
+        if self.cfg.TARGET_WALLET or self._wallet_discovery is None:
+            return
+
+        try:
+            profiles = self._wallet_discovery.discover()
+        except Exception as exc:
+            self.log.debug("Wallet tier refresh failed: %s", exc)
+            return
+
+        if not profiles:
+            return
+
+        # Profiles are already sorted by score descending from discover()
+        top_n = profiles[:HIGH_CONFIDENCE_WALLET_COUNT]
+        self._high_confidence_wallets = {p.proxy_wallet for p in top_n}
+
+        self.log.info(
+            "Wallet tiers refreshed: %d HIGH (%s), %d STANDARD",
+            len(self._high_confidence_wallets),
+            [p.proxy_wallet[:10] + "…" for p in top_n],
+            len(profiles) - len(self._high_confidence_wallets),
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # v41: Profitable exit tracking (re-entry)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _refresh_profitable_exits(self) -> None:
+        """
+        Scan the position tracker for markets where our copy-trade position
+        closed profitably.  These markets become eligible for re-entry.
+
+        A "profitable close" is detected by:
+          1. Position is resolved with resolution_price >= 0.99 (we won), OR
+          2. Position was sold (SELL in trade history) at a price higher than
+             the entry price.
+
+        Only copy_trading positions are considered.
+        """
+        tracker = self._get_position_tracker()
+        if tracker is None:
+            return
+
+        # Check resolved positions for wins
+        for pos in tracker.get_all_positions(include_resolved=True):
+            if not pos.resolved:
+                continue
+            if pos.market_id in self._profitable_exits:
+                continue  # Already tracked
+            if pos.market_id in self._market_side_taken:
+                # This was a copy-trade market — check if it was profitable
+                if pos.resolution_price >= 0.99:
+                    # Won: resolution at $1
+                    self._profitable_exits[pos.market_id] = True
+                    self.log.info(
+                        "Profitable exit detected (resolution WIN): market %s",
+                        pos.market_id[:16],
+                    )
+                elif pos.current_price > pos.entry_price:
+                    # Sold above entry (trailing stop or manual exit)
+                    self._profitable_exits[pos.market_id] = True
+                    self.log.info(
+                        "Profitable exit detected (sold above entry): market %s "
+                        "(entry=%.3f, exit=%.3f)",
+                        pos.market_id[:16], pos.entry_price, pos.current_price,
+                    )
+
+    def _get_position_tracker(self):
+        """
+        Retrieve the PositionTracker from the risk manager.
+
+        Returns:
+            PositionTracker instance or None if not accessible.
+        """
+        tracker = getattr(self, '_position_tracker', None)
+        if tracker is not None:
+            return tracker
+        if self.risk_manager:
+            tracker = getattr(self.risk_manager, 'tracker', None)
+            if tracker is not None:
+                return tracker
+        return None
 

@@ -233,8 +233,10 @@ class StrategyOptimizer:
         from high-weight (proven) strategies.
         """
         weight = self.get_strategy_weight(signal.strategy)
-        # Floor: always allow signals with confidence >= 0.90
-        effective_weight = max(weight, 0.10)
+        # Floor: gate threshold never exceeds 0.70 (v41)
+        # With floor=0.30, even the worst strategy only requires
+        # confidence >= 0.70 to pass, not the old 0.90 deadlock.
+        effective_weight = max(weight, 0.30)
         min_confidence = 1.0 - effective_weight
         return signal.confidence >= min_confidence
 
@@ -551,8 +553,10 @@ class StrategyOptimizer:
             # Clamp the shift
             clamped_delta = max(-self.max_param_shift, min(self.max_param_shift, delta))
             new_weight = current + clamped_delta
-            # Floor: every strategy gets at least 10%
-            self.state.strategy_weights[strat_name] = max(new_weight, 0.10)
+            # Floor: every strategy gets at least 30% (v41)
+            # Prevents the deadlock where all weights crater to ~10%
+            # and the gate blocks every signal (confidence >= 0.90).
+            self.state.strategy_weights[strat_name] = max(new_weight, 0.30)
 
         # Re-normalise after flooring
         total = sum(self.state.strategy_weights[s] for s in ALL_STRATEGIES)
